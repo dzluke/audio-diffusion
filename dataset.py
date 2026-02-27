@@ -123,7 +123,7 @@ def decode_audio(encoding: torch.Tensor, model) -> Tuple[torch.Tensor, torch.Ten
         model: The stable audio model with pretransform decoder.
         
     Returns:
-        Tuple of (decoded_float, decoded_int16) tensors.
+        Audio
     """
     decoded = model.pretransform.decode(encoding)
     
@@ -133,7 +133,7 @@ def decode_audio(encoding: torch.Tensor, model) -> Tuple[torch.Tensor, torch.Ten
         audio = audio / maxval
     audio_int16 = (audio.clamp(-1, 1) * 32767).to(torch.int16).cpu()[0]
     
-    return decoded, audio_int16
+    return audio_int16
 
 
 def compute_latent_stats(embeddings_dir: str | Path) -> Tuple[float, float]:
