@@ -115,7 +115,7 @@ def embed_audio(audio: torch.Tensor, sr: int, model, sample_size: int, device: s
     return encoded
 
 
-def decode_audio(encoding: torch.Tensor, model) -> Tuple[torch.Tensor, torch.Tensor]:
+def decode_audio(encoding: torch.Tensor, model, jupyter=False) -> Tuple[torch.Tensor, torch.Tensor]:
     """Decode latent embedding back to audio.
     
     Args:
@@ -125,15 +125,16 @@ def decode_audio(encoding: torch.Tensor, model) -> Tuple[torch.Tensor, torch.Ten
     Returns:
         Audio
     """
-    decoded = model.pretransform.decode(encoding)
+    audio = model.pretransform.decode(encoding).squeeze(0)
     
-    audio = rearrange(decoded, "b d n -> b d n")
     maxval = torch.max(torch.abs(audio))
     if maxval > 0:
         audio = audio / maxval
-    audio_int16 = (audio.clamp(-1, 1) * 32767).to(torch.int16).cpu()[0]
+
+    if jupyter: # convert to the format expected by IPython.display.Audio
+        audio = (audio.clamp(-1, 1) * 32767).to(torch.int16).cpu()
     
-    return audio_int16
+    return audio
 
 
 def compute_latent_stats(embeddings_dir: str | Path) -> Tuple[float, float]:
