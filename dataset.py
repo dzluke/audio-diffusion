@@ -238,15 +238,26 @@ class LatentAudioDataset(Dataset):
         root: Directory containing .pt embedding files.
         normalize: If True, normalize latents using stored mean/std.
                    Stats are loaded from latent_stats.pt or computed if missing.
+        transform: Optional transform to apply to each sample.
+        dim: If specified, slice the last dimension to this size and expand dataset.
+             E.g., dim=64 on (1, 64, 1024) yields 16 samples of (1, 64, 64) per file.
     """
     
-    def __init__(self, root: str | Path, normalize: bool = True, transform: Optional[Any] = None):
+    def __init__(self, root: str | Path, normalize: bool = False, transform: Optional[Any] = None, dim: Optional[int] = None):
         self.root = Path(root)
         self.files = [f for f in os.listdir(root) if f.endswith(".pt") and f != "latent_stats.pt"]
         self.normalize = normalize
         self.mean: Optional[float] = None
         self.std: Optional[float] = None
         self.transform = transform
+        self.dim = dim
+        self.slices_per_file = 1
+        
+        # Compute number of slices per file based on first file's shape
+        if self.dim is not None and len(self.files) > 0:
+            sample = torch.load(self.root / self.files[0])
+            last_dim = sample.shape[-1]
+            self.slices_per_file = last_dim // self.dim
         
         if normalize:
             self._load_or_compute_stats()
@@ -265,10 +276,20 @@ class LatentAudioDataset(Dataset):
             print(f"Saved latent stats to {stats_path}")
     
     def __len__(self) -> int:
-        return len(self.files)
+        return len(self.files) * self.slices_per_file
     
     def __getitem__(self, idx: int) -> torch.Tensor:
-        sample = torch.load(self.root / self.files[idx])
+        file_idx = idx // self.slices_per_file
+        slice_idx = idx % self.slices_per_file
+        
+        sample = torch.load(self.root / self.files[file_idx])
+        
+        # Slice to specified dimension if provided
+        if self.dim is not None:
+            start = slice_idx * self.dim
+            end = start + self.dim
+            sample = sample[..., start:end]
+        
         if self.normalize and self.mean is not None and self.std is not None:
             sample = normalize_latents(sample, self.mean, self.std)
         if self.transform is not None:
