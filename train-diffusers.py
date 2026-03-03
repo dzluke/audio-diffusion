@@ -23,19 +23,28 @@ from diffusers import DDPMScheduler, UNet2DModel, DDIMPipeline
 from dataset import LatentAudioDataset, decode_audio, load_model as load_audio_codec
 from IPython.display import Audio
 
-
 EMBEDDINGS_PATH = Path("C:/Users/dzluk/stable-audio-tools/data/blackbird/embeddings")
 SAMPLING_RATE = 44100
-RUNS_DIR = Path("diffusers-training-runs")
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+class TrainingConfig:
+    latent_shape = (64, 64)
+    train_batch_size = 4
+    eval_batch_size = 1 # how many audios to sample during evaluation
+    num_epochs = 500
+    learning_rate = 4e-4
+    save_audio_epochs = 50  # how often to sample during training (in epochs)
+    save_model_epochs = 50  # how often to save the model during training (in epochs)
+    output_dir = "diffusers-training-runs"
+
+    seed = 42
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
 
 def sample(x, model, scheduler, num_sampling_steps):
         """
         Given a noise sample x, iteratively denoise it num_sampling_steps times using the model and scheduler
         x has shape (b, 1, 64, 64)
         """
-
         scheduler.set_timesteps(num_sampling_steps)
 
         for t in scheduler.timesteps:
@@ -49,10 +58,10 @@ def sample(x, model, scheduler, num_sampling_steps):
         return x
 
 
-def create_run_dir():
+def create_run_dir(parent_dir):
     """Create a timestamped run directory with subdirectories for logs, samples, and pipeline."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = RUNS_DIR / f"run_{timestamp}"
+    run_dir = parent_dir / f"run_{timestamp}"
     logs_dir = run_dir / "logs"
     samples_dir = run_dir / "samples"
     pipeline_dir = run_dir / "pipeline"
@@ -64,17 +73,12 @@ def create_run_dir():
     return run_dir, logs_dir, samples_dir, pipeline_dir
 
 
-def generate_and_log_samples(model, noise_scheduler, writer, samples_dir, epoch, num_samples=2):
+def generate_and_log_samples(noise_input, model, noise_scheduler,writer, samples_dir, epoch):
     """Generate audio samples and log them to TensorBoard."""
     model.eval()
     num_sampling_steps = 50
-    
-    samples = sample(
-        torch.randn((num_samples, 1, 64, 64), device=device), 
-        model, 
-        noise_scheduler, 
-        num_sampling_steps
-    )
+
+    samples = sample(noise_input, model, noise_scheduler, num_sampling_steps)
     
     # Load audio codec only when needed
     audio_codec, _ = load_audio_codec()
@@ -101,29 +105,25 @@ def generate_and_log_samples(model, noise_scheduler, writer, samples_dir, epoch,
 
 
 def train():
-    time_dim = 64
-    # You can lower your batch size if you're running out of GPU memory
-    batch_size = 4
-    # training takes about 2 mins per epoch
-    epochs = 500
+    config = TrainingConfig()
 
     # Create run directory structure
-    run_dir, logs_dir, samples_dir, pipeline_dir = create_run_dir()
+    run_dir, logs_dir, samples_dir, pipeline_dir = create_run_dir(config.output_dir)
     print(f"Run directory: {run_dir}")
     
     # Initialize TensorBoard writer
     writer = SummaryWriter(log_dir=str(logs_dir))
 
-    dataset = LatentAudioDataset(EMBEDDINGS_PATH, normalize=False, dim=time_dim)
+    dataset = LatentAudioDataset(EMBEDDINGS_PATH, normalize=False, dim=config.latent_shape[1])
 
     # Create a dataloader from the dataset to serve up the transformed images in batches
     train_dataloader = torch.utils.data.DataLoader(
-        dataset, batch_size=batch_size, shuffle=True
+        dataset, batch_size=config.train_batch_size, shuffle=True
     )
 
     # Create a model
     model = UNet2DModel(
-        sample_size=time_dim,  # the target image resolution
+        sample_size=config.latent_shape[0],  # the target image resolution
         in_channels=1,  # the number of input channels, 3 for RGB images
         out_channels=1,  # the number of output channels
         layers_per_block=2,  # how many ResNet layers to use per UNet block
@@ -141,7 +141,7 @@ def train():
             "UpBlock2D",  # a regular ResNet upsampling block
         ),
     )
-    model.to(device)
+    model.to(config.device)
 
     # Set the noise scheduler
     noise_scheduler = DDPMScheduler(
@@ -149,15 +149,18 @@ def train():
     )
     assert noise_scheduler.config.clip_sample is False
 
+    # create some random noise which will be used to generate sample audio during training
+    sample_noise = torch.randn((config.eval_batch_size, 1, *config.latent_shape), device=config.device)
+
     # Training loop
-    optimizer = torch.optim.AdamW(model.parameters(), lr=4e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
 
     losses = []
     global_step = 0
 
-    for epoch in range(epochs):
+    for epoch in range(config.num_epochs):
         for step, batch in enumerate(train_dataloader):
-            clean_images = batch.to(device)
+            clean_images = batch.to(config.device)
             # Sample noise to add to the images
             noise = torch.randn(clean_images.shape).to(clean_images.device)
             bs = clean_images.shape[0]
@@ -193,14 +196,14 @@ def train():
         if (epoch + 1) % 5 == 0:
             print(f"Epoch:{epoch+1}, loss: {loss_last_epoch}")
 
-        # Generate and log audio samples every 50 epochs
-        if (epoch) % 50 == 0:
-            print(f"Generating audio samples at epoch {epoch + 1}...")
-            generate_and_log_samples(
-                model, noise_scheduler, writer, samples_dir, epoch + 1, num_samples=2
-            )
+        # Generate and log audio samples
+        if (epoch + 1) % config.save_audio_epochs == 0:
+            print(f"Generating audio samples at epoch {epoch}...")
+            generate_and_log_samples(sample_noise, model, noise_scheduler, writer, samples_dir, epoch)
 
     print("Finished training!")
+
+    generate_and_log_samples(sample_noise, model, noise_scheduler, writer, samples_dir, epoch)
 
     trained_pipeline = DDIMPipeline(unet=model, scheduler=noise_scheduler)
     trained_pipeline.scheduler.config.clip_sample = False
@@ -210,9 +213,6 @@ def train():
     # Close TensorBoard writer
     writer.close()
 
-    return trained_pipeline
-
 
 if __name__ == "__main__":
     train()
-
