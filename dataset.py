@@ -90,14 +90,14 @@ def load_model(
 
 
 
-def embed_audio(audio: torch.Tensor, sr: int, model, sample_size: int, device: str) -> torch.Tensor:
+def encode_audio(audio: torch.Tensor, sr: int, model, params, device: str) -> torch.Tensor:
     """Encode audio into latent embedding using the model's pretransform.
     
     Args:
         audio: Audio tensor of shape [C, N].
         sr: Sample rate of the input audio.
         model: The stable audio model with pretransform encoder.
-        sample_size: Target sample size for the model.
+        params: Dictionary containing model parameters.
         device: Device to run encoding on.
         
     Returns:
@@ -107,7 +107,7 @@ def embed_audio(audio: torch.Tensor, sr: int, model, sample_size: int, device: s
         audio,
         in_sr=sr,
         target_sr=model.sample_rate,
-        target_length=sample_size,
+        target_length=params['sample_size'],
         target_channels=model.pretransform.io_channels,
         device=device,
     )
@@ -115,7 +115,7 @@ def embed_audio(audio: torch.Tensor, sr: int, model, sample_size: int, device: s
     return encoded
 
 
-def decode_audio(encoding: torch.Tensor, model, jupyter=False) -> Tuple[torch.Tensor, torch.Tensor]:
+def decode_audio(encoding: torch.Tensor, model) -> Tuple[torch.Tensor, torch.Tensor]:
     """Decode latent embedding back to audio.
     
     Args:
@@ -131,8 +131,9 @@ def decode_audio(encoding: torch.Tensor, model, jupyter=False) -> Tuple[torch.Te
     if maxval > 0:
         audio = audio / maxval
 
-    if jupyter: # convert to the format expected by IPython.display.Audio
-        audio = (audio.clamp(-1, 1) * 32767).to(torch.int16).cpu()
+    # I think jupyter can work with audio in range [-1, 1], so we dont need this
+    # if jupyter: # convert to the format expected by IPython.display.Audio
+    #     audio = (audio.clamp(-1, 1) * 32767).to(torch.int16).cpu()
     
     return audio
 
@@ -175,7 +176,7 @@ def generate_embeddings(
     audio_dir: str | Path,
     save_dir: str | Path,
     model,
-    sample_size: int,
+    params: dict,
     device: str,
     expected_sr: int = 44100,
     chunk_size: int = 2097152,
@@ -189,7 +190,7 @@ def generate_embeddings(
         audio_dir: Directory containing audio files.
         save_dir: Directory to save embedding .pt files.
         model: The stable audio model with pretransform encoder.
-        sample_size: Target sample size for the model.
+        params: Dictionary containing model parameters.
         device: Device to run encoding on.
         expected_sr: Expected sample rate of audio files.
         chunk_size: Number of samples per chunk.
@@ -212,7 +213,7 @@ def generate_embeddings(
             
             for chunk_idx in range(wav.shape[1] // chunk_size):
                 chunk_audio = wav[:, chunk_idx * chunk_size:(chunk_idx + 1) * chunk_size]
-                embedding = embed_audio(chunk_audio, sr, model, sample_size, device)
+                embedding = encode_audio(chunk_audio, sr, model, params, device)
                 
                 save_path = save_dir / f"{file.stem}_chunk_{chunk_idx}.pt"
                 torch.save(embedding.detach().cpu(), save_path)
