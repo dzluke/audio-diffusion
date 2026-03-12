@@ -27,16 +27,20 @@ EMBEDDINGS_PATH = Path("C:/Users/dzluk/stable-audio-tools/data/blackbird/embeddi
 SAMPLING_RATE = 44100
 
 class TrainingConfig:
-    latent_shape = (64, 64)
+    latent_shape = (64, 256)
     train_batch_size = 16
     eval_batch_size = 1 # how many audios to sample during evaluation
-    num_epochs = 250
+    num_epochs = 300
     learning_rate = 4e-4
     save_audio_epochs = 50  # how often to sample during training (in epochs)
-    save_model_epochs = 50  # how often to save the model during training (in epochs)
+    # save_model_epochs = 50  # how often to save the model during training (in epochs)
     eval_every_epochs = 5  # how often to compute evaluation loss
     val_split = 0.1  # fraction of data to use for validation
-    output_dir = Path("diffusers-training-runs")
+    output_dir = Path("logs")
+
+    # model architecture settings
+    # block_out_channels = (64, 128, 128, 256)  # used up until 3/5/26
+    block_out_channels = (128, 256, 256, 512)
     
     # FAD evaluation settings
     compute_fad = True  # whether to compute FAD during evaluation
@@ -263,11 +267,11 @@ def train():
 
     # Create a model
     model = UNet2DModel(
-        sample_size=config.latent_shape[0],  # the target image resolution
+        sample_size=config.latent_shape,  # the target image resolution
         in_channels=1,  # the number of input channels, 3 for RGB images
         out_channels=1,  # the number of output channels
         layers_per_block=2,  # how many ResNet layers to use per UNet block
-        block_out_channels=(64, 128, 128, 256),  # More channels -> more parameters
+        block_out_channels=config.block_out_channels,  # More channels -> more parameters
         down_block_types=(
             "DownBlock2D",  # a regular ResNet downsampling block
             "DownBlock2D",
