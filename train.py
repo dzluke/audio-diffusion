@@ -1,251 +1,341 @@
 """
-Docstring for train
+Train a diffusion model on the blackbird dataset using the Hugging Face Diffusers library.
 
-based on code from https://colab.research.google.com/github/huggingface/notebooks/blob/main/diffusers/training_example.ipynb
+Run on CNMATGPU with:
 
 """
 
-
+import numpy as np
+import time
 import torch
 import torch.nn.functional as F
 import torchaudio
-from diffusers import DDPMScheduler, UNet2DModel, DDIMScheduler, DDPMPipeline, DDIMPipeline
-from diffusers.optimization import get_cosine_schedule_with_warmup
-import numpy as np
-from dataset import LatentAudioDataset, decode_audio, load_model as load_audio_model, denormalize_latents
+from matplotlib import pyplot as plt
+from PIL import Image
+import torchvision
 from pathlib import Path
-from accelerate import Accelerator
-from accelerate.utils import ProjectConfiguration
-from tqdm.auto import tqdm
-import os
-import time
+from torchvision import transforms
+from datetime import datetime, timedelta
+from torch.utils.tensorboard import SummaryWriter
+from diffusers import DDPMScheduler, UNet2DModel, DDIMPipeline
+from diffusers.training_utils import EMAModel
+from diffusers.optimization import get_cosine_schedule_with_warmup
+from dataset import LatentAudioDataset, decode_audio, load_model as load_audio_codec
+from evaluate import compute_validation_loss, compute_fad, get_reference_embeddings
 
+EMBEDDINGS_PATH = Path("C:/Users/dzluk/stable-audio-tools/data/blackbird/embeddings")
 SAMPLING_RATE = 44100
-DATA_PATH = Path("C:/Users/dzluk/stable-audio-tools/data/blackbird")
-AUDIO_PATH = DATA_PATH / "audio"
-EMBEDDINGS_PATH = DATA_PATH / "embeddings"
-
-BATCH_SIZE = 2
-NUM_EPOCHS = 30
-EMBEDDING_DIM = (64, 1024)  # this is the size of one audio embedding
-CHUNK_SIZE = 2097152 # number of samples per chunk (e.g., 2097152 for ~47 seconds at 44.1kHz)
-
 
 class TrainingConfig:
-    image_size = (64, 1024)  # the generated image resolution
-    train_batch_size = 4
-    eval_batch_size = 1 # how many images to sample during evaluation
-    num_epochs = 500
-    gradient_accumulation_steps = 2
-    learning_rate = 5e-5
-    lr_warmup_steps = 500
-    save_audio_epochs = 10  # how often to save generated audio samples during training (in epochs)
+    latent_shape = (64, 64)
+    train_batch_size = 16
+    eval_batch_size = 1 # how many audios to sample during evaluation
+    num_epochs = 250
+    learning_rate = 4e-4
+    save_audio_epochs = 50  # how often to sample during training (in epochs)
     save_model_epochs = 50  # how often to save the model during training (in epochs)
-    mixed_precision = 'fp16'  # `no` for float32, `fp16` for automatic mixed precision
-    output_dir = 'blackbird'  # the model name locally and on the HF Hub
+    eval_every_epochs = 5  # how often to compute evaluation loss
+    val_split = 0.1  # fraction of data to use for validation
+    output_dir = Path("diffusers-training-runs")
+    
+    # FAD evaluation settings
+    compute_fad = True  # whether to compute FAD during evaluation
+    fad_num_samples = 10  # number of samples to generate for FAD computation
 
-    push_to_hub = False  # whether to upload the saved model to the HF Hub
-    hub_private_repo = False  
-    overwrite_output_dir = False  # overwrite the old model when re-running the notebook
+    # EMA settings
+    use_ema = True  # whether to use exponential moving average
+    ema_decay = 0.9999  # EMA decay rate (higher = slower update)
+    ema_update_after_step = 0  # start EMA updates after this many steps
+    ema_power = 0.75  # power for EMA warmup
+
+    # Learning rate scheduling
+    use_lr_scheduler = True  # whether to use learning rate scheduling
+    lr_warmup_steps = 500  # number of warmup steps for learning rate scheduler
+
     seed = 42
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    resume_from_checkpoint = None  # None to start fresh, or Path to checkpoint dir, or "latest" to auto-find most recent
 
-def evaluate(config, epoch, pipeline, audio_model, accelerator, global_step, dataset):
-    """Sample latents from the diffusion model, decode to audio, and log to TensorBoard.
+
+def sample(x, model, scheduler, num_sampling_steps):
+        """
+        Given a noise sample x, iteratively denoise it num_sampling_steps times using the model and scheduler
+        x has shape (b, 1, 64, 64)
+        """
+        scheduler.set_timesteps(num_sampling_steps)
+
+        for t in scheduler.timesteps:
+            with torch.no_grad():
+                noise_pred = model(x, t).sample
+
+            x = scheduler.step(
+                noise_pred, t, x
+            ).prev_sample
+
+        return x
+
+
+def create_run_dir(parent_dir):
+    """Create a timestamped run directory with subdirectories for logs, samples, and pipeline."""
+    timestamp = (datetime.now() + timedelta(hours=9)).strftime("%Y%m%d_%H%M%S")  # +9h for Paris time
+    run_dir = parent_dir / f"run_{timestamp}"
+    logs_dir = run_dir / "logs"
+    samples_dir = run_dir / "samples"
+    pipeline_dir = run_dir / "pipeline"
+    
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    samples_dir.mkdir(parents=True, exist_ok=True)
+    pipeline_dir.mkdir(parents=True, exist_ok=True)
+    
+    return run_dir, logs_dir, samples_dir, pipeline_dir
+
+
+def save_run_info(run_dir, config, model, noise_scheduler, train_size, val_size):
+    """Save hyperparameters and model architecture to a human-readable text file."""
+    info_path = run_dir / "run_info.txt"
+    
+    with open(info_path, "w") as f:
+        f.write("="*60 + "\n")
+        f.write("TRAINING RUN CONFIGURATION\n")
+        f.write(f"Started: {(datetime.now() + timedelta(hours=9)).strftime('%Y-%m-%d %H:%M:%S')} (Paris)\n")
+        f.write("="*60 + "\n\n")
+        
+        # Hyperparameters
+        f.write("HYPERPARAMETERS\n")
+        f.write("-"*40 + "\n")
+        f.write(f"Latent shape:        {config.latent_shape}\n")
+        f.write(f"Train batch size:    {config.train_batch_size}\n")
+        f.write(f"Eval batch size:     {config.eval_batch_size}\n")
+        f.write(f"Number of epochs:    {config.num_epochs}\n")
+        f.write(f"Learning rate:       {config.learning_rate}\n")
+        # f.write(f"Save audio epochs:   {config.save_audio_epochs}\n")
+        # f.write(f"Save model epochs:   {config.save_model_epochs}\n")
+        # f.write(f"Eval every epochs:   {config.eval_every_epochs}\n")
+        # f.write(f"Validation split:    {config.val_split}\n")
+        # f.write(f"Seed:                {config.seed}\n")
+        # f.write(f"Device:              {config.device}\n")
+        f.write("\n")
+        
+        # Dataset info
+        f.write("DATASET\n")
+        f.write("-"*40 + "\n")
+        f.write(f"Embeddings path:     {EMBEDDINGS_PATH}\n")
+        f.write(f"Train size:          {train_size}\n")
+        f.write(f"Validation size:     {val_size}\n")
+        f.write("\n")
+        
+        # Noise scheduler
+        f.write("NOISE SCHEDULER\n")
+        f.write("-"*40 + "\n")
+        f.write(f"Type:                {type(noise_scheduler).__name__}\n")
+        f.write(f"Train timesteps:     {noise_scheduler.config.num_train_timesteps}\n")
+        f.write(f"Beta schedule:       {noise_scheduler.config.beta_schedule}\n")
+        f.write(f"Clip sample:         {noise_scheduler.config.clip_sample}\n")
+        f.write("\n")
+        
+        # Model architecture
+        f.write("MODEL ARCHITECTURE\n")
+        f.write("-"*40 + "\n")
+        f.write(f"Type:                {type(model).__name__}\n")
+        f.write(f"Sample size:         {model.config.sample_size}\n")
+        f.write(f"In channels:         {model.config.in_channels}\n")
+        f.write(f"Out channels:        {model.config.out_channels}\n")
+        f.write(f"Layers per block:    {model.config.layers_per_block}\n")
+        f.write(f"Block out channels:  {model.config.block_out_channels}\n")
+        f.write(f"Down block types:    {model.config.down_block_types}\n")
+        f.write(f"Up block types:      {model.config.up_block_types}\n")
+        f.write("\n")
+        
+        # Model size
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        f.write(f"Total parameters:    {total_params:,}\n")
+        f.write(f"Trainable params:    {trainable_params:,}\n")
+        f.write("\n")
+        
+        # FAD evaluation settings
+        f.write("EVALUATION METRICS\n")
+        f.write("-"*40 + "\n")
+        f.write(f"Compute FAD:         {config.compute_fad}\n")
+        if config.compute_fad:
+            f.write(f"FAD num samples:     {config.fad_num_samples}\n")
+        f.write("\n")
+        
+        f.write("="*60 + "\n")
+    
+    print(f"Run info saved to {info_path}")
+
+
+def generate_and_log_samples(noise_input, model, noise_scheduler, writer, samples_dir, epoch,
+                             config=None, reference_embeddings=None, ema_model=None):
+    """Generate audio samples and log them to TensorBoard.
     
     Args:
-        config: Training configuration.
-        epoch: Current epoch number.
-        pipeline: DDPMPipeline for sampling.
-        audio_model: Stable audio model for decoding latents to audio.
-        accelerator: Accelerator instance for TensorBoard logging.
-        global_step: Current global training step.
-        dataset: LatentAudioDataset instance (used to check if normalization was applied).
+        noise_input: Random noise tensor to start sampling from
+        model: The diffusion model
+        noise_scheduler: The noise scheduler
+        writer: TensorBoard SummaryWriter
+        samples_dir: Directory to save audio samples
+        epoch: Current epoch number
+        config: TrainingConfig for FAD settings (optional)
+        reference_embeddings: Reference latent embeddings for FAD computation (optional)
+        ema_model: EMA model wrapper (optional). If provided, uses EMA weights for sampling.
+    
+    Returns:
+        FAD score if computed, else None
     """
-    # Sample latents from random noise (backward diffusion process)
-    # DDPMPipeline returns images, but for us these are latent tensors
-    output = pipeline(
-        batch_size=config.eval_batch_size,
-        generator=torch.manual_seed(config.seed),
-        output_type="np",  # Get numpy arrays instead of PIL images
-        num_inference_steps=50,  # DDIM allows fewer steps than DDPM
-    )
+    model.eval()
     
-    # The pipeline output is NHWC [B, H, W, C], convert to NCHW [B, C, H, W] -> [B, 1, 64, 1024]
-    latents = torch.from_numpy(output.images).to(config.device)
-    latents = latents.permute(0, 3, 1, 2)  # NHWC -> NCHW
+    # Use EMA weights for sampling if available
+    if ema_model is not None:
+        ema_model.store(model.parameters())
+        ema_model.copy_to(model.parameters())
+    num_sampling_steps = 50
+
+    samples = sample(noise_input, model, noise_scheduler, num_sampling_steps)
     
-    # Denormalize latents back to original scale before decoding (if training used normalization)
-    if dataset.normalize and dataset.mean is not None and dataset.std is not None:
-        latents = denormalize_latents(latents, dataset.mean, dataset.std)
+    # Compute FAD on latent embeddings if enabled
+    fad_score = None
+    if config is not None and config.compute_fad and reference_embeddings is not None:
+        fad_score = compute_fad(samples, reference_embeddings)
+        if fad_score is not None:
+            writer.add_scalar("metrics/fad", fad_score, epoch)
+            print(f"Epoch {epoch} FAD score: {fad_score:.4f}")
     
-    # Save directory for audio samples
-    test_dir = os.path.join(config.output_dir, "samples")
-    os.makedirs(test_dir, exist_ok=True)
+    # Load audio codec only when needed
+    audio_codec, _ = load_audio_codec()
     
-    # Get TensorBoard writer from accelerator
-    tb_tracker = accelerator.get_tracker("tensorboard")
-    writer = tb_tracker.writer
+    # Create epoch-specific directory for audio samples
+    epoch_samples_dir = samples_dir / f"epoch_{epoch}"
+    epoch_samples_dir.mkdir(parents=True, exist_ok=True)
     
-    # Decode each latent to audio and save
-    for i in range(latents.shape[0]):
-        # decode_audio expects [B, C, N] latent, we have [B, 1, 64, 1024]
-        latent = latents[i:i+1]  # Keep batch dim: [1, 1, 64, 1024]
-        latent = latent.squeeze(1)  # [1, 64, 1024]
+    for i, s in enumerate(samples):
+        audio = decode_audio(s, audio_codec)
         
-        # Decode latent to audio
-        decoded_float, audio_int16 = decode_audio(latent, audio_model)
+        # Save audio file (expects shape [channels, samples])
+        audio_path = epoch_samples_dir / f"sample_{i}.wav"
+        torchaudio.save(str(audio_path), audio.cpu(), SAMPLING_RATE)
         
-        # Save as wav file
-        audio_path = os.path.join(test_dir, f"epoch{epoch:04d}_sample{i:02d}.wav")
-        torchaudio.save(audio_path, audio_int16.cpu(), SAMPLING_RATE)
-        
-        # Save latent tensor
-        # latent_path = os.path.join(test_dir, f"epoch{epoch:04d}_sample{i:02d}_latent.pt")
-        # torch.save(latent.cpu(), latent_path)
-        
-        # Log audio to TensorBoard
-        # TensorBoard expects audio as 1D float tensor in range [-1, 1]
-        audio_float = audio_int16[0].float() / 32767.0  # Take first channel, convert to float [-1, 1]
-        writer.add_audio(
-            f"samples/sample_{i:02d}",
-            audio_float,
-            global_step=global_step,
-            sample_rate=SAMPLING_RATE,
-        )
-        
-        # Log latent visualization as image (normalize for display)
-        # latent_viz = latent[0].cpu().float()  # [64, 1024]
-        # latent_viz = (latent_viz - latent_viz.min()) / (latent_viz.max() - latent_viz.min() + 1e-8)
-        # writer.add_image(
-        #     f"latents/sample_{i:02d}",
-        #     latent_viz.unsqueeze(0),  # Add channel dim: [1, 64, 1024]
-        #     global_step=global_step,
-        # )
+        if config is not None and i < config.eval_batch_size:
+            # Log to TensorBoard (expects 1D float array in [-1, 1])
+            audio_mono = (audio[0] + audio[1]) / 2  # Convert to mono by averaging channels
+            audio_np = audio_mono.cpu().numpy()
+            writer.add_audio(f"samples/sample_{i}", audio_np, epoch, sample_rate=SAMPLING_RATE)
     
-    # Log epoch summary
-    writer.add_scalar("epoch", epoch, global_step)
+    # Unload audio codec to free GPU memory
+    del audio_codec
+    torch.cuda.empty_cache()
+    
+    # Restore original model weights if EMA was used
+    if ema_model is not None:
+        ema_model.restore(model.parameters())
+    
+    model.train()
+    return fad_score
 
 
-def main():
+def train():
     config = TrainingConfig()
-    
-    # Load the stable audio model for decoding latents back to audio during evaluation
-    print("Loading stable audio model for decoding...")
-    audio_model, audio_params = load_audio_model(device=config.device)
 
+    # Create run directory structure
+    run_dir, logs_dir, samples_dir, pipeline_dir = create_run_dir(config.output_dir)
+    print(f"Run directory: {run_dir}")
     
-    # create dataloader for training (with normalization enabled)
-    dataset = LatentAudioDataset(EMBEDDINGS_PATH, normalize=True)
-    train_dataloader = torch.utils.data.DataLoader(dataset, batch_size=config.train_batch_size, shuffle=True)
+    # Initialize TensorBoard writer
+    writer = SummaryWriter(log_dir=str(logs_dir))
+
+    dataset = LatentAudioDataset(EMBEDDINGS_PATH, normalize=False, dim=config.latent_shape[1])
+
+    # Split dataset into train and validation sets
+    val_size = int(len(dataset) * config.val_split)
+    train_size = len(dataset) - val_size
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        dataset, [train_size, val_size], generator=torch.Generator().manual_seed(config.seed)
+    )
+    print(f"Train size: {train_size}, Val size: {val_size}")
+
+    # Create dataloaders
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset, batch_size=config.train_batch_size, shuffle=True
+    )
+    val_dataloader = torch.utils.data.DataLoader(
+        val_dataset, batch_size=config.train_batch_size, shuffle=False
+    )
 
     # Create a model
     model = UNet2DModel(
-        sample_size=config.image_size,  # the target image resolution
+        sample_size=config.latent_shape[0],  # the target image resolution
         in_channels=1,  # the number of input channels, 3 for RGB images
         out_channels=1,  # the number of output channels
         layers_per_block=2,  # how many ResNet layers to use per UNet block
-        block_out_channels=(128, 256, 256, 512),  # the number of output channes for each UNet block
-        down_block_types=( 
+        block_out_channels=(64, 128, 128, 256),  # More channels -> more parameters
+        down_block_types=(
             "DownBlock2D",  # a regular ResNet downsampling block
             "DownBlock2D",
-            "DownBlock2D",
             "AttnDownBlock2D",  # a ResNet downsampling block with spatial self-attention
-        ), 
+            "AttnDownBlock2D",
+        ),
         up_block_types=(
+            "AttnUpBlock2D",
             "AttnUpBlock2D",  # a ResNet upsampling block with spatial self-attention
+            "UpBlock2D",
             "UpBlock2D",  # a regular ResNet upsampling block
-            "UpBlock2D",
-            "UpBlock2D",
         ),
     )
     model.to(config.device)
 
-    # define noise scheduler
-    noise_scheduler = DDPMScheduler(num_train_timesteps=1000, beta_schedule="squaredcos_cap_v2")
+    # Set the noise scheduler
+    noise_scheduler = DDPMScheduler(
+        num_train_timesteps=1000, beta_schedule="squaredcos_cap_v2", clip_sample=False
+    )
+    assert noise_scheduler.config.clip_sample is False
 
+    # Initialize EMA model
+    ema_model = None
+    if config.use_ema:
+        ema_model = EMAModel(
+            model.parameters(),
+            decay=config.ema_decay,
+            update_after_step=config.ema_update_after_step,
+            model_cls=UNet2DModel,
+            model_config=model.config,
+        )
+        ema_model.to(config.device)
+        print(f"EMA model initialized with decay={config.ema_decay}")
+
+    # Save run info
+    save_run_info(run_dir, config, model, noise_scheduler, train_size, val_size)
+
+    # Prepare reference embeddings for FAD computation
+    reference_embeddings = None
+    if config.compute_fad:
+        reference_embeddings = get_reference_embeddings(val_dataset, num_samples=config.fad_num_samples)
+
+    # create some random noise which will be used to generate sample audio during training
+    # Use fad_num_samples when FAD is enabled, otherwise use eval_batch_size
+    num_samples = config.fad_num_samples if config.compute_fad else config.eval_batch_size
+    sample_noise = torch.randn((num_samples, 1, *config.latent_shape), device=config.device)
+
+    # Training loop
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
-    lr_scheduler = get_cosine_schedule_with_warmup(
-        optimizer=optimizer,
-        num_warmup_steps=config.lr_warmup_steps,
-        num_training_steps=(len(train_dataloader) * config.num_epochs),
-    )
 
-    # Initialize accelerator and tensorboard logging
-    logging_dir = os.path.join(config.output_dir, "logs")
-    accelerator_project_config = ProjectConfiguration(project_dir=config.output_dir, logging_dir=logging_dir)
-    accelerator = Accelerator(
-        mixed_precision=config.mixed_precision,
-        gradient_accumulation_steps=config.gradient_accumulation_steps, 
-        log_with="tensorboard",
-        project_config=accelerator_project_config,
-    )
-    if accelerator.is_main_process:
-        if config.push_to_hub:
-            pass
-            # repo_id = create_repo(
-            #     repo_id=Path(config.output_dir).name, exist_ok=True
-            # ).repo_id
-        elif config.output_dir is not None:
-            os.makedirs(config.output_dir, exist_ok=True)
-        
-        # Determine next run number for TensorBoard logs
-        os.makedirs(logging_dir, exist_ok=True)
-        existing_runs = [d for d in os.listdir(logging_dir) if d.startswith("run") and d[3:].isdigit()]
-        if existing_runs:
-            next_run = max(int(d[3:]) for d in existing_runs) + 1
-        else:
-            next_run = 0
-        run_name = f"run{next_run}"
-        accelerator.init_trackers(run_name)
-        print("Initialized TensorBoard tracking with run name:", run_name)
-    
-    # Prepare everything
-    # There is no specific order to remember, you just need to unpack the 
-    # objects in the same order you gave them to the prepare method.
-    model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, lr_scheduler
-    )
-    
-    # Resume from checkpoint if specified
+    # Set up learning rate scheduler
+    lr_scheduler = None
+    if config.use_lr_scheduler:
+        num_training_steps = len(train_dataloader) * config.num_epochs
+        lr_scheduler = get_cosine_schedule_with_warmup(
+            optimizer=optimizer,
+            num_warmup_steps=config.lr_warmup_steps,
+            num_training_steps=num_training_steps,
+        )
+        print(f"LR scheduler initialized with {config.lr_warmup_steps} warmup steps, {num_training_steps} total steps")
+
+    losses = []
     global_step = 0
-    starting_epoch = 0
-    checkpoint_dir = os.path.join(config.output_dir, "checkpoints")
     
-    if config.resume_from_checkpoint:
-        if config.resume_from_checkpoint == "latest":
-            # Find the most recent checkpoint
-            if os.path.exists(checkpoint_dir):
-                checkpoints = [d for d in os.listdir(checkpoint_dir) if d.startswith("checkpoint-")]
-                if checkpoints:
-                    checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
-                    resume_path = os.path.join(checkpoint_dir, checkpoints[-1])
-                    print(f"Resuming from latest checkpoint: {resume_path}")
-                else:
-                    resume_path = None
-                    print("No checkpoints found, starting from scratch")
-            else:
-                resume_path = None
-                print("No checkpoint directory found, starting from scratch")
-        else:
-            resume_path = config.resume_from_checkpoint
-        
-        if resume_path and os.path.exists(resume_path):
-            accelerator.load_state(resume_path)
-            # Extract step from checkpoint name (checkpoint-{global_step})
-            global_step = int(os.path.basename(resume_path).split("-")[1])
-            starting_epoch = global_step // len(train_dataloader)
-            print(f"Resumed training from step {global_step}, epoch {starting_epoch}")
+    # Timing tracking
+    training_start_time = time.time()
 
-    # Now you train the model
-    for epoch in range(starting_epoch, config.num_epochs):
-        epoch_start_time = time.time()
-        progress_bar = tqdm(total=len(train_dataloader), disable=not accelerator.is_local_main_process)
-        progress_bar.set_description(f"Epoch {epoch}")
-        
-        epoch_losses = []  # Track losses for epoch average
-
+    for epoch in range(config.num_epochs):
         for step, batch in enumerate(train_dataloader):
             clean_images = batch.to(config.device)
             # Sample noise to add to the images
@@ -253,74 +343,96 @@ def main():
             bs = clean_images.shape[0]
 
             # Sample a random timestep for each image
-            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bs,), device=clean_images.device).long()
+            timesteps = torch.randint(
+                0, noise_scheduler.num_train_timesteps, (bs,), device=clean_images.device
+            ).long()
 
             # Add noise to the clean images according to the noise magnitude at each timestep
-            # (this is the forward diffusion process)
             noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
-            
-            with accelerator.accumulate(model):
-                # Predict the noise residual
-                noise_pred = model(noisy_images, timesteps, return_dict=False)[0]
-                loss = F.mse_loss(noise_pred, noise)
-                accelerator.backward(loss)
 
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
-            
-            progress_bar.update(1)
-            epoch_losses.append(loss.detach().item())
-            logs = {
-                "loss": loss.detach().item(),
-                "lr": lr_scheduler.get_last_lr()[0],
-                "step": global_step
-            }
-            progress_bar.set_postfix(**logs)
-            accelerator.log(logs, step=global_step)
+            # Get the model prediction
+            noise_pred = model(noisy_images, timesteps, return_dict=False)[0]
+
+            # Calculate the loss
+            loss = F.mse_loss(noise_pred, noise)
+            loss.backward(loss)
+            losses.append(loss.item())
+
+            # Log step loss to TensorBoard
+            writer.add_scalar("loss/step", loss.item(), global_step)
             global_step += 1
+
+            # Update the model parameters with the optimizer
+            optimizer.step()
+            optimizer.zero_grad()
+
+            # Step the learning rate scheduler
+            if lr_scheduler is not None:
+                lr_scheduler.step()
+
+            # Update EMA weights
+            if ema_model is not None:
+                ema_model.step(model.parameters())
+
+        # Calculate and log epoch loss
+        loss_last_epoch = sum(losses[-len(train_dataloader):]) / len(train_dataloader)
+        writer.add_scalar("loss/epoch", loss_last_epoch, epoch + 1)
         
-        # Log epoch-level metrics
-        if accelerator.is_main_process:
-            epoch_duration = time.time() - epoch_start_time
-            avg_loss = sum(epoch_losses) / len(epoch_losses)
-            tb_tracker = accelerator.get_tracker("tensorboard")
-            writer = tb_tracker.writer
-            writer.add_scalar("epoch/avg_loss", avg_loss, epoch)
-            writer.add_scalar("epoch/learning_rate", lr_scheduler.get_last_lr()[0], epoch)
-            writer.add_scalar("epoch/duration_seconds", epoch_duration, epoch)
-            print(f"Epoch {epoch} - Average Loss: {avg_loss:.6f} - Duration: {epoch_duration:.1f}s")
+        # Log learning rate
+        if lr_scheduler is not None:
+            current_lr = lr_scheduler.get_last_lr()[0]
+            writer.add_scalar("lr", current_lr, epoch)
 
-        # After each epoch you optionally sample some demo images with evaluate() and save the model
-        if accelerator.is_main_process:
-            # Use DDIM for faster sampling (50 steps vs 1000 for DDPM)
-            ddim_scheduler = DDIMScheduler.from_config(noise_scheduler.config)
-            pipeline = DDIMPipeline(unet=accelerator.unwrap_model(model), scheduler=ddim_scheduler)
+        if (epoch) % 5 == 0:
+            elapsed_time = time.time() - training_start_time
+            iterations_per_sec = global_step / elapsed_time
+            avg_time_per_epoch = elapsed_time / (epoch + 1)
+            remaining_epochs = config.num_epochs - (epoch + 1)
+            estimated_remaining = remaining_epochs * avg_time_per_epoch
+            
+            # Format remaining time
+            remaining_mins, remaining_secs = divmod(int(estimated_remaining), 60)
+            remaining_hours, remaining_mins = divmod(remaining_mins, 60)
+            
+            print(f"Epoch:{epoch}, loss: {loss_last_epoch:.6f} | "
+                  f"{iterations_per_sec:.2f} it/s | "
+                  f"avg: {avg_time_per_epoch:.2f}s/epoch | "
+                  f"ETA: {remaining_hours}h {remaining_mins}m {remaining_secs}s")
 
-            if (epoch + 1) % config.save_audio_epochs == 0 or epoch == config.num_epochs - 1:
-                evaluate(config, epoch, pipeline, audio_model, accelerator, global_step, dataset)
+        # Compute and log evaluation loss
+        if (epoch + 1) % config.eval_every_epochs == 0:
+            val_loss = compute_validation_loss(model, val_dataloader, noise_scheduler, config.device)
+            writer.add_scalar("loss/validation", val_loss, epoch + 1)
+            print(f"Epoch:{epoch+1}, val_loss: {val_loss}")
 
-            if (epoch + 1) % config.save_model_epochs == 0 or epoch == config.num_epochs - 1:
-                if config.push_to_hub:
-                    pass
-                    # upload_folder(
-                    #     repo_id=repo_id,
-                    #     folder_path=config.output_dir,
-                    #     commit_message=f"Epoch {epoch}",
-                    #     ignore_patterns=["step_*", "epoch_*"],
-                    # )
-                else:
-                    pipeline.save_pretrained(config.output_dir)
-                
-                # Save full checkpoint for resumption
-                os.makedirs(checkpoint_dir, exist_ok=True)
-                save_path = os.path.join(checkpoint_dir, f"checkpoint-{global_step}")
-                accelerator.save_state(save_path)
-                print(f"Saved checkpoint to {save_path}") 
+        # Generate and log audio samples
+        if (epoch) % config.save_audio_epochs == 0:
+            print(f"Generating audio samples at epoch {epoch}...")
+            generate_and_log_samples(
+                sample_noise, model, noise_scheduler, writer, samples_dir, epoch,
+                config=config, reference_embeddings=reference_embeddings, ema_model=ema_model
+            )
 
-    accelerator.end_training()
-    print("Training complete!")
+    print("Finished training!")
+
+    generate_and_log_samples(
+        sample_noise, model, noise_scheduler, writer, samples_dir, epoch,
+        config=config, reference_embeddings=reference_embeddings, ema_model=ema_model
+    )
+
+    # Copy EMA weights to model for saving
+    if ema_model is not None:
+        ema_model.copy_to(model.parameters())
+        print("Copied EMA weights to model for saving")
+
+    trained_pipeline = DDIMPipeline(unet=model, scheduler=noise_scheduler)
+    trained_pipeline.scheduler.config.clip_sample = False
+    print(f"Saving trained pipeline to {pipeline_dir}")
+    trained_pipeline.save_pretrained(str(pipeline_dir))
+
+    # Close TensorBoard writer
+    writer.close()
 
 
 if __name__ == "__main__":
-    main()
+    train()
