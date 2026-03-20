@@ -5,13 +5,15 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = "==3.11.9"
 dependencies = [
-    "accelerate>=1.12.0",
     "diffusers>=0.36.0",
     "einops>=0.8.2",
     "ipykernel>=7.2.0",
-    "numpy>=2.4.2",
-    "scipy>=1.17.0",
+    "numpy==1.23.5",
+    "scipy<1.11",
     "setuptools==69.5.1",
+    "accelerate>=1.12.0",
+    "stable-audio-tools>=0.0.19",
+    "tensorboard>=2.20.0",
     "torch>=2.10.0",
     "torchaudio>=2.10.0",
 ]
@@ -20,3 +22,11 @@ dependencies = [
 name = "pytorch-cu126"
 url = "https://download.pytorch.org/whl/cu126"
 explicit = true
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu126", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+torchvision = [
+  { index = "pytorch-cu126", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
