@@ -206,13 +206,12 @@ dependencies = [
     { name = "numpy" },
     { name = "scipy" },
     { name = "setuptools" },
+    { name = "soundfile" },
     { name = "stable-audio-tools" },
     { name = "tensorboard" },
     { name = "torch", version = "2.10.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
     { name = "torch", version = "2.10.0+cu126", source = { registry = "https://download.pytorch.org/whl/cu126" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
-    { name = "torchaudio" },
-    { name = "torchcodec", version = "0.10.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
-    { name = "torchcodec", version = "0.10.0+cu126", source = { registry = "https://download.pytorch.org/whl/cu126" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "torchcodec" },
 ]
 
 [package.metadata]
@@ -224,13 +223,12 @@ requires-dist = [
     { name = "numpy", specifier = "==1.23.5" },
     { name = "scipy", specifier = "<1.11" },
     { name = "setuptools", specifier = "==69.5.1" },
+    { name = "soundfile", specifier = ">=0.13.1" },
     { name = "stable-audio-tools", specifier = ">=0.0.19" },
     { name = "tensorboard", specifier = ">=2.20.0" },
     { name = "torch", marker = "sys_platform != 'linux' and sys_platform != 'win32'", specifier = ">=2.10.0" },
     { name = "torch", marker = "sys_platform == 'linux' or sys_platform == 'win32'", specifier = ">=2.10.0", index = "https://download.pytorch.org/whl/cu126" },
-    { name = "torchaudio", specifier = ">=2.10.0" },
-    { name = "torchcodec", marker = "sys_platform != 'linux' and sys_platform != 'win32'", specifier = ">=0.10.0" },
-    { name = "torchcodec", marker = "sys_platform == 'linux' or sys_platform == 'win32'", specifier = ">=0.10.0", index = "https://download.pytorch.org/whl/cu126" },
+    { name = "torchcodec", specifier = ">=0.10.0" },
 ]
 
 [[package]]
@@ -2847,24 +2845,10 @@ wheels = [
 name = "torchcodec"
 version = "0.10.0"
 source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "sys_platform != 'linux' and sys_platform != 'win32'",
-]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/1c/0d/51ab5cb4ba8eb60e3e39651a4d43be89a592cc193fe11feb6509509b0121/torchcodec-0.10.0-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:3dde1ebd9677ec1587f1e45486b3d59bd3e41a0bf4fc9b3dc6880e64c421ad56", size = 3907950, upload-time = "2026-01-22T15:41:43.819Z" },
-]
-
-[[package]]
-name = "torchcodec"
-version = "0.10.0+cu126"
-source = { registry = "https://download.pytorch.org/whl/cu126" }
-resolution-markers = [
-    "sys_platform == 'linux'",
-    "sys_platform == 'win32'",
-]
-wheels = [
-    { url = "https://download.pytorch.org/whl/cu126/torchcodec-0.10.0%2Bcu126-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:cb22c174674d358cc1d97eae8ebc5f65b2b4831338c2ea020fc7f0108fa4f086" },
-    { url = "https://download.pytorch.org/whl/cu126/torchcodec-0.10.0%2Bcu126-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:01b97785c18f4ec3f539270d33e5fa08e840148ab50e3aed4d9606e10e20ccae" },
+    { url = "https://files.pythonhosted.org/packages/b9/c8/618bde55c1908583290883537326174e633a383a8337226ce0c7c6d70090/torchcodec-0.10.0-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:2e2be11c4468a58940572fcf5f8ed5e41187c1de214267f692e2fd5ac8731198", size = 2070483, upload-time = "2026-01-22T15:41:36.743Z" },
+    { url = "https://files.pythonhosted.org/packages/74/f1/75d70391de0581069864b3c204bb7e463a2b3b32e840ff9d103688a6db94/torchcodec-0.10.0-cp311-cp311-win_amd64.whl", hash = "sha256:f51d9435d3c75c0b55f5dc64a22ce9cfb58ac19013cdd8ce572a523ef75e2b58", size = 2219702, upload-time = "2026-01-22T15:41:50.933Z" },
 ]
 
 [[package]]

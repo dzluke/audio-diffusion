@@ -13,7 +13,7 @@ from typing import Tuple, Optional, Any, Dict
 import numpy as np
 import scipy.io.wavfile
 import torch
-import torchaudio
+import soundfile as sf
 from einops import rearrange
 from torch.utils.data import Dataset
 from stable_audio_tools.inference.utils import prepare_audio
@@ -208,7 +208,7 @@ def generate_embeddings(
     
     for file in audio_dir.iterdir():
         if file.suffix.lower() in extensions:
-            wav, sr = torchaudio.load(str(file))
+            wav, sr = sf.read(str(file))
             assert sr == expected_sr, f"Expected {expected_sr} Hz, got {sr} Hz for file {file}"
             
             for chunk_idx in range(wav.shape[1] // chunk_size):

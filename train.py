@@ -9,10 +9,9 @@ import numpy as np
 import time
 import torch
 import torch.nn.functional as F
-import torchaudio
+import soundfile as sf
 from PIL import Image
 from pathlib import Path
-# from torchvision import transforms
 from datetime import datetime, timedelta
 from torch.utils.tensorboard import SummaryWriter
 from diffusers import DDPMScheduler, UNet2DModel, DDIMPipeline
@@ -217,7 +216,7 @@ def generate_and_log_samples(noise_input, model, noise_scheduler, writer, sample
         
         # Save audio file (expects shape [channels, samples])
         audio_path = epoch_samples_dir / f"sample_{i}.wav"
-        torchaudio.save(str(audio_path), audio.cpu(), SAMPLING_RATE)
+        sf.write(str(audio_path), audio.cpu().numpy().T, SAMPLING_RATE)
         
         if config is not None and i < config.eval_batch_size:
             # Log to TensorBoard (expects 1D float array in [-1, 1])

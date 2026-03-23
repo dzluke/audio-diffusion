@@ -15,8 +15,8 @@ dependencies = [
     "stable-audio-tools>=0.0.19",
     "tensorboard>=2.20.0",
     "torch>=2.10.0",
-    "torchaudio>=2.10.0",
     "torchcodec>=0.10.0",
+    "soundfile>=0.13.1",
 ]
 
 [[tool.uv.index]]
