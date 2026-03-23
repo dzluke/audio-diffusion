@@ -10,11 +10,9 @@ import time
 import torch
 import torch.nn.functional as F
 import torchaudio
-from matplotlib import pyplot as plt
 from PIL import Image
-import torchvision
 from pathlib import Path
-from torchvision import transforms
+# from torchvision import transforms
 from datetime import datetime, timedelta
 from torch.utils.tensorboard import SummaryWriter
 from diffusers import DDPMScheduler, UNet2DModel, DDIMPipeline
@@ -29,21 +27,22 @@ SAMPLING_RATE = 44100
 class TrainingConfig:
     latent_shape = (64, 256)
     train_batch_size = 16
-    eval_batch_size = 1 # how many audios to sample during evaluation
-    num_epochs = 300
+    eval_batch_size = 3 # how many audios to sample during evaluation
+    num_epochs = 500
     learning_rate = 4e-4
-    save_audio_epochs = 50  # how often to sample during training (in epochs)
+    save_audio_epochs = 100  # how often to sample during training (in epochs)
     # save_model_epochs = 50  # how often to save the model during training (in epochs)
-    eval_every_epochs = 5  # how often to compute evaluation loss
+    eval_every_epochs = 10  # how often to compute evaluation loss
     val_split = 0.1  # fraction of data to use for validation
     output_dir = Path("logs")
 
     # model architecture settings
+    prediction_type = "v_prediction"  # "epsilon" or "v_prediction"
     # block_out_channels = (64, 128, 128, 256)  # used up until 3/5/26
     block_out_channels = (128, 256, 256, 512)
     
     # FAD evaluation settings
-    compute_fad = True  # whether to compute FAD during evaluation
+    compute_fad = False  # whether to compute FAD during evaluation
     fad_num_samples = 10  # number of samples to generate for FAD computation
 
     # EMA settings
@@ -63,7 +62,7 @@ class TrainingConfig:
 def sample(x, model, scheduler, num_sampling_steps):
         """
         Given a noise sample x, iteratively denoise it num_sampling_steps times using the model and scheduler
-        x has shape (b, 1, 64, 64)
+        x has shape (b, 1, 64, time_dim)
         """
         scheduler.set_timesteps(num_sampling_steps)
 
@@ -134,6 +133,7 @@ def save_run_info(run_dir, config, model, noise_scheduler, train_size, val_size)
         f.write(f"Train timesteps:     {noise_scheduler.config.num_train_timesteps}\n")
         f.write(f"Beta schedule:       {noise_scheduler.config.beta_schedule}\n")
         f.write(f"Clip sample:         {noise_scheduler.config.clip_sample}\n")
+        f.write(f"Prediction type:     {noise_scheduler.config.prediction_type}\n")
         f.write("\n")
         
         # Model architecture
@@ -249,6 +249,11 @@ def train():
 
     dataset = LatentAudioDataset(EMBEDDINGS_PATH, normalize=False, dim=config.latent_shape[1])
 
+    # TODO temporary REMOVE
+    # try with only  10% of the data
+    # dataset_size = int(len(dataset) * 0.1)
+    # dataset = torch.utils.data.Subset(dataset, list(range(dataset_size)))
+
     # Split dataset into train and validation sets
     val_size = int(len(dataset) * config.val_split)
     train_size = len(dataset) - val_size
@@ -289,7 +294,10 @@ def train():
 
     # Set the noise scheduler
     noise_scheduler = DDPMScheduler(
-        num_train_timesteps=1000, beta_schedule="squaredcos_cap_v2", clip_sample=False
+        num_train_timesteps=1000, 
+        beta_schedule="squaredcos_cap_v2", 
+        clip_sample=False, 
+        prediction_type=config.prediction_type
     )
     assert noise_scheduler.config.clip_sample is False
 
@@ -347,18 +355,23 @@ def train():
             bs = clean_images.shape[0]
 
             # Sample a random timestep for each image
-            timesteps = torch.randint(
-                0, noise_scheduler.num_train_timesteps, (bs,), device=clean_images.device
-            ).long()
+            timesteps = torch.randint(0, noise_scheduler.num_train_timesteps, (bs,), device=clean_images.device).long()
 
             # Add noise to the clean images according to the noise magnitude at each timestep
             noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
 
             # Get the model prediction
-            noise_pred = model(noisy_images, timesteps, return_dict=False)[0]
+            model_pred = model(noisy_images, timesteps, return_dict=False)[0]
+
+            if config.prediction_type == "epsilon":
+                target = noise
+            elif config.prediction_type == "v_prediction":
+                target = noise_scheduler.get_velocity(clean_images, noise, timesteps)
+            else:
+                raise ValueError(f"Unsupported prediction type: {config.prediction_type}")
 
             # Calculate the loss
-            loss = F.mse_loss(noise_pred, noise)
+            loss = F.mse_loss(model_pred, target)
             loss.backward(loss)
             losses.append(loss.item())
 
