@@ -2,7 +2,6 @@
 
 This module provides:
 - Validation loss computation
-- Frechet Distance calculation on latent embeddings
 """
 
 import numpy as np
@@ -10,7 +9,8 @@ from scipy import linalg
 import torch
 import torch.nn.functional as F
 
-def compute_validation_loss(model, val_dataloader, noise_scheduler, device):
+
+def compute_validation_loss(model, val_dataloader, noise_scheduler, device, prediction_type):
     """Compute average loss on validation set.
     
     Args:
@@ -38,7 +38,15 @@ def compute_validation_loss(model, val_dataloader, noise_scheduler, device):
             
             noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
             noise_pred = model(noisy_images, timesteps, return_dict=False)[0]
-            loss = F.mse_loss(noise_pred, noise)
+
+            if prediction_type == "epsilon":
+                target = noise
+            elif prediction_type == "v_prediction":
+                target = noise_scheduler.get_velocity(clean_images, noise, timesteps)
+            else:
+                raise ValueError(f"Unsupported prediction type: {prediction_type}")
+
+            loss = F.mse_loss(noise_pred, target)
             
             total_loss += loss.item()
             num_batches += 1

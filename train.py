@@ -10,7 +10,6 @@ import time
 import torch
 import torch.nn.functional as F
 import soundfile as sf
-from PIL import Image
 from pathlib import Path
 from datetime import datetime, timedelta
 from torch.utils.tensorboard import SummaryWriter
@@ -18,7 +17,10 @@ from diffusers import DDPMScheduler, UNet2DModel, DDIMPipeline
 from diffusers.training_utils import EMAModel
 from diffusers.optimization import get_cosine_schedule_with_warmup
 from dataset import LatentAudioDataset, decode_audio, load_model as load_audio_codec
-from evaluate import compute_validation_loss, compute_fad, get_reference_embeddings
+from evaluate import (
+    compute_validation_loss,
+    sample_reference_latents,
+)
 
 EMBEDDINGS_PATH = Path("C:/Users/dzluk/stable-audio-tools/data/blackbird/embeddings")
 SAMPLING_RATE = 44100
@@ -32,6 +34,7 @@ class TrainingConfig:
     save_audio_epochs = 100  # how often to sample during training (in epochs)
     # save_model_epochs = 50  # how often to save the model during training (in epochs)
     eval_every_epochs = 10  # how often to compute evaluation loss
+    
     val_split = 0.1  # fraction of data to use for validation
     output_dir = Path("logs")
 
@@ -39,11 +42,10 @@ class TrainingConfig:
     prediction_type = "v_prediction"  # "epsilon" or "v_prediction"
     # block_out_channels = (64, 128, 128, 256)  # used up until 3/5/26
     block_out_channels = (128, 256, 256, 512)
+    layers_per_block = 3
+    dropout = 0.1
+    attention_head_dim = 32
     
-    # FAD evaluation settings
-    compute_fad = False  # whether to compute FAD during evaluation
-    fad_num_samples = 10  # number of samples to generate for FAD computation
-
     # EMA settings
     use_ema = True  # whether to use exponential moving average
     ema_decay = 0.9999  # EMA decay rate (higher = slower update)
@@ -51,7 +53,7 @@ class TrainingConfig:
     ema_power = 0.75  # power for EMA warmup
 
     # Learning rate scheduling
-    use_lr_scheduler = True  # whether to use learning rate scheduling
+    use_lr_scheduler = False  # whether to use learning rate scheduling
     lr_warmup_steps = 500  # number of warmup steps for learning rate scheduler
 
     seed = 42
@@ -146,6 +148,9 @@ def save_run_info(run_dir, config, model, noise_scheduler, train_size, val_size)
         f.write(f"Block out channels:  {model.config.block_out_channels}\n")
         f.write(f"Down block types:    {model.config.down_block_types}\n")
         f.write(f"Up block types:      {model.config.up_block_types}\n")
+        f.write(f"Layers per block:    {model.config.layers_per_block}\n")
+        f.write(f"Dropout:             {model.config.dropout}\n")
+        f.write(f"Attention head dim:  {model.config.attention_head_dim}\n")
         f.write("\n")
         
         # Model size
@@ -158,9 +163,7 @@ def save_run_info(run_dir, config, model, noise_scheduler, train_size, val_size)
         # FAD evaluation settings
         f.write("EVALUATION METRICS\n")
         f.write("-"*40 + "\n")
-        f.write(f"Compute FAD:         {config.compute_fad}\n")
-        if config.compute_fad:
-            f.write(f"FAD num samples:     {config.fad_num_samples}\n")
+        f.write("None!")
         f.write("\n")
         
         f.write("="*60 + "\n")
@@ -168,8 +171,27 @@ def save_run_info(run_dir, config, model, noise_scheduler, train_size, val_size)
     print(f"Run info saved to {info_path}")
 
 
+def _format_duration(seconds):
+    """Format seconds as Hh Mm Ss string."""
+    total = int(seconds)
+    mins, secs = divmod(total, 60)
+    hours, mins = divmod(mins, 60)
+    return f"{hours}h {mins}m {secs}s"
+
+
+def append_timing_info(run_dir, total_training_seconds, avg_epoch_seconds):
+    """Append timing statistics to run_info.txt at the end of training."""
+    info_path = run_dir / "run_info.txt"
+    with open(info_path, "a") as f:
+        f.write("TIMING SUMMARY\n")
+        f.write("-"*40 + "\n")
+        f.write(f"Total training time:       {_format_duration(total_training_seconds)} ({total_training_seconds:.2f}s)\n")
+        f.write(f"Average epoch time:        {_format_duration(avg_epoch_seconds)} ({avg_epoch_seconds:.2f}s)\n")
+        f.write("\n")
+
+
 def generate_and_log_samples(noise_input, model, noise_scheduler, writer, samples_dir, epoch,
-                             config=None, reference_embeddings=None, ema_model=None):
+                             config=None, ema_model=None):
     """Generate audio samples and log them to TensorBoard.
     
     Args:
@@ -179,12 +201,8 @@ def generate_and_log_samples(noise_input, model, noise_scheduler, writer, sample
         writer: TensorBoard SummaryWriter
         samples_dir: Directory to save audio samples
         epoch: Current epoch number
-        config: TrainingConfig for FAD settings (optional)
-        reference_embeddings: Reference latent embeddings for FAD computation (optional)
+        config: TrainingConfig (optional)
         ema_model: EMA model wrapper (optional). If provided, uses EMA weights for sampling.
-    
-    Returns:
-        FAD score if computed, else None
     """
     model.eval()
     
@@ -195,14 +213,6 @@ def generate_and_log_samples(noise_input, model, noise_scheduler, writer, sample
     num_sampling_steps = 50
 
     samples = sample(noise_input, model, noise_scheduler, num_sampling_steps)
-    
-    # Compute FAD on latent embeddings if enabled
-    fad_score = None
-    if config is not None and config.compute_fad and reference_embeddings is not None:
-        fad_score = compute_fad(samples, reference_embeddings)
-        if fad_score is not None:
-            writer.add_scalar("metrics/fad", fad_score, epoch)
-            print(f"Epoch {epoch} FAD score: {fad_score:.4f}")
     
     # Load audio codec only when needed
     audio_codec, _ = load_audio_codec()
@@ -233,11 +243,13 @@ def generate_and_log_samples(noise_input, model, noise_scheduler, writer, sample
         ema_model.restore(model.parameters())
     
     model.train()
-    return fad_score
 
 
-def train():
-    config = TrainingConfig()
+def train(config: TrainingConfig):
+    run_start_time = time.time()
+
+    if config is None:
+        config = TrainingConfig()
 
     # Create run directory structure
     run_dir, logs_dir, samples_dir, pipeline_dir = create_run_dir(config.output_dir)
@@ -247,11 +259,6 @@ def train():
     writer = SummaryWriter(log_dir=str(logs_dir))
 
     dataset = LatentAudioDataset(EMBEDDINGS_PATH, normalize=False, dim=config.latent_shape[1])
-
-    # TODO temporary REMOVE
-    # try with only  10% of the data
-    # dataset_size = int(len(dataset) * 0.1)
-    # dataset = torch.utils.data.Subset(dataset, list(range(dataset_size)))
 
     # Split dataset into train and validation sets
     val_size = int(len(dataset) * config.val_split)
@@ -274,30 +281,32 @@ def train():
         sample_size=config.latent_shape,  # the target image resolution
         in_channels=1,  # the number of input channels, 3 for RGB images
         out_channels=1,  # the number of output channels
-        layers_per_block=2,  # how many ResNet layers to use per UNet block
+        layers_per_block=config.layers_per_block,  # how many ResNet layers to use per UNet block
         block_out_channels=config.block_out_channels,  # More channels -> more parameters
+        attention_head_dim=config.attention_head_dim, 
         down_block_types=(
             "DownBlock2D",  # a regular ResNet downsampling block
-            "DownBlock2D",
+            "AttnDownBlock2D",
             "AttnDownBlock2D",  # a ResNet downsampling block with spatial self-attention
             "AttnDownBlock2D",
         ),
         up_block_types=(
             "AttnUpBlock2D",
             "AttnUpBlock2D",  # a ResNet upsampling block with spatial self-attention
-            "UpBlock2D",
+            "AttnUpBlock2D",
             "UpBlock2D",  # a regular ResNet upsampling block
         ),
+        dropout=config.dropout,
     )
     model.to(config.device)
 
     # Set the noise scheduler
     noise_scheduler = DDPMScheduler(
-        num_train_timesteps=1000, 
         beta_schedule="squaredcos_cap_v2", 
         clip_sample=False, 
         prediction_type=config.prediction_type
     )
+    noise_scheduler.config.num_train_timesteps = 1000
     assert noise_scheduler.config.clip_sample is False
 
     # Initialize EMA model
@@ -316,20 +325,14 @@ def train():
     # Save run info
     save_run_info(run_dir, config, model, noise_scheduler, train_size, val_size)
 
-    # Prepare reference embeddings for FAD computation
-    reference_embeddings = None
-    if config.compute_fad:
-        reference_embeddings = get_reference_embeddings(val_dataset, num_samples=config.fad_num_samples)
-
     # create some random noise which will be used to generate sample audio during training
-    # Use fad_num_samples when FAD is enabled, otherwise use eval_batch_size
-    num_samples = config.fad_num_samples if config.compute_fad else config.eval_batch_size
-    sample_noise = torch.randn((num_samples, 1, *config.latent_shape), device=config.device)
+    sample_noise = torch.randn((config.eval_batch_size, 1, *config.latent_shape), generator=torch.Generator(device=config.device).manual_seed(config.seed), device=config.device)
 
     # Training loop
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
 
     # Set up learning rate scheduler
+    # TODO: it's not clear to me if this actually affects the learning rate
     lr_scheduler = None
     if config.use_lr_scheduler:
         num_training_steps = len(train_dataloader) * config.num_epochs
@@ -342,11 +345,13 @@ def train():
 
     losses = []
     global_step = 0
+    epoch_times = []
     
     # Timing tracking
     training_start_time = time.time()
 
     for epoch in range(config.num_epochs):
+        epoch_start_time = time.time()
         for step, batch in enumerate(train_dataloader):
             clean_images = batch.to(config.device)
             # Sample noise to add to the images
@@ -371,7 +376,7 @@ def train():
 
             # Calculate the loss
             loss = F.mse_loss(model_pred, target)
-            loss.backward(loss)
+            loss.backward()
             losses.append(loss.item())
 
             # Log step loss to TensorBoard
@@ -417,7 +422,13 @@ def train():
 
         # Compute and log evaluation loss
         if (epoch + 1) % config.eval_every_epochs == 0:
-            val_loss = compute_validation_loss(model, val_dataloader, noise_scheduler, config.device)
+            val_loss = compute_validation_loss(
+                model,
+                val_dataloader,
+                noise_scheduler,
+                config.device,
+                prediction_type=config.prediction_type,
+            )
             writer.add_scalar("loss/validation", val_loss, epoch + 1)
             print(f"Epoch:{epoch+1}, val_loss: {val_loss}")
 
@@ -426,14 +437,17 @@ def train():
             print(f"Generating audio samples at epoch {epoch}...")
             generate_and_log_samples(
                 sample_noise, model, noise_scheduler, writer, samples_dir, epoch,
-                config=config, reference_embeddings=reference_embeddings, ema_model=ema_model
+                config=config, ema_model=ema_model
             )
+
+        epoch_time = time.time() - epoch_start_time
+        epoch_times.append(epoch_time)
 
     print("Finished training!")
 
     generate_and_log_samples(
         sample_noise, model, noise_scheduler, writer, samples_dir, epoch,
-        config=config, reference_embeddings=reference_embeddings, ema_model=ema_model
+        config=config, ema_model=ema_model
     )
 
     # Copy EMA weights to model for saving
@@ -446,9 +460,20 @@ def train():
     print(f"Saving trained pipeline to {pipeline_dir}")
     trained_pipeline.save_pretrained(str(pipeline_dir))
 
+    total_training_time = time.time() - run_start_time
+    avg_epoch_time = float(np.mean(epoch_times)) if len(epoch_times) > 0 else 0.0
+    print(f"Total training time: {_format_duration(total_training_time)}")
+
+    append_timing_info(
+        run_dir=run_dir,
+        total_training_seconds=total_training_time,
+        avg_epoch_seconds=avg_epoch_time,
+    )
+
     # Close TensorBoard writer
     writer.close()
 
 
 if __name__ == "__main__":
-    train()
+    config = TrainingConfig()
+    train(config)
