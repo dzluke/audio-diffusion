@@ -37,7 +37,7 @@ def compute_validation_loss(model, val_dataloader, noise_scheduler, device, pred
             ).long()
             
             noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
-            noise_pred = model(noisy_images, timesteps, return_dict=False)[0]
+            noise_pred = model(noisy_images, timesteps)
 
             if prediction_type == "epsilon":
                 target = noise

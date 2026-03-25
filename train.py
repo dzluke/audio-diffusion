@@ -1,8 +1,5 @@
 """
 Train a diffusion model on the blackbird dataset using the Hugging Face Diffusers library.
-
-Run on CNMATGPU with:
-
 """
 
 import numpy as np
@@ -10,28 +7,32 @@ import time
 import torch
 import torch.nn.functional as F
 import soundfile as sf
+from tqdm.auto import tqdm
 from pathlib import Path
 from datetime import datetime, timedelta
 from torch.utils.tensorboard import SummaryWriter
-from diffusers import DDPMScheduler, UNet2DModel, DDIMPipeline
+from diffusers import DDPMScheduler, UNet2DModel
 from diffusers.training_utils import EMAModel
 from diffusers.optimization import get_cosine_schedule_with_warmup
 from dataset import LatentAudioDataset, decode_audio, load_model as load_audio_codec
-from evaluate import (
-    compute_validation_loss,
-    sample_reference_latents,
-)
+from evaluate import compute_validation_loss
+from models import create_model, DiffusersUNet2DModel
+
 
 EMBEDDINGS_PATH = Path("C:/Users/dzluk/stable-audio-tools/data/blackbird/embeddings")
 SAMPLING_RATE = 44100
 
 class TrainingConfig:
+    # model_name can be "Diffusers-UNet2DModel" or "SAO-DiT"
+    model_name = "Diffusers-UNet2DModel" 
+    # model_name = "SAO-DiT"
+
     latent_shape = (64, 256)
     train_batch_size = 16
     eval_batch_size = 3 # how many audios to sample during evaluation
-    num_epochs = 500
+    num_epochs = 300
     learning_rate = 4e-4
-    save_audio_epochs = 100  # how often to sample during training (in epochs)
+    save_audio_epochs = 50  # how often to sample during training (in epochs)
     # save_model_epochs = 50  # how often to save the model during training (in epochs)
     eval_every_epochs = 10  # how often to compute evaluation loss
     
@@ -42,9 +43,22 @@ class TrainingConfig:
     prediction_type = "v_prediction"  # "epsilon" or "v_prediction"
     # block_out_channels = (64, 128, 128, 256)  # used up until 3/5/26
     block_out_channels = (128, 256, 256, 512)
-    layers_per_block = 3
-    dropout = 0.1
-    attention_head_dim = 32
+    down_block_types = (
+            "DownBlock2D",
+            "DownBlock2D", # you can try adding attn here but it will ~5x training time
+            "AttnDownBlock2D",
+            "AttnDownBlock2D",
+    )
+    up_block_types = (
+            "AttnUpBlock2D",
+            "AttnUpBlock2D",  
+            "UpBlock2D",
+            "UpBlock2D", 
+    )
+    layers_per_block = 2 # default is 2, can try 3 but will almost double training time
+    dropout = 0.1 # default is 0
+    attention_head_dim = 8 # default is 8, try 32 (the number of attention heads = num channels / attention_head_dim)
+    sample_type = "conv" # can be "conv" or "resnet"
     
     # EMA settings
     use_ema = True  # whether to use exponential moving average
@@ -69,7 +83,7 @@ def sample(x, model, scheduler, num_sampling_steps):
 
         for t in scheduler.timesteps:
             with torch.no_grad():
-                noise_pred = model(x, t).sample
+                noise_pred = model(x, t)
 
             x = scheduler.step(
                 noise_pred, t, x
@@ -111,12 +125,6 @@ def save_run_info(run_dir, config, model, noise_scheduler, train_size, val_size)
         f.write(f"Eval batch size:     {config.eval_batch_size}\n")
         f.write(f"Number of epochs:    {config.num_epochs}\n")
         f.write(f"Learning rate:       {config.learning_rate}\n")
-        # f.write(f"Save audio epochs:   {config.save_audio_epochs}\n")
-        # f.write(f"Save model epochs:   {config.save_model_epochs}\n")
-        # f.write(f"Eval every epochs:   {config.eval_every_epochs}\n")
-        # f.write(f"Validation split:    {config.val_split}\n")
-        # f.write(f"Seed:                {config.seed}\n")
-        # f.write(f"Device:              {config.device}\n")
         f.write("\n")
         
         # Dataset info
@@ -140,17 +148,7 @@ def save_run_info(run_dir, config, model, noise_scheduler, train_size, val_size)
         # Model architecture
         f.write("MODEL ARCHITECTURE\n")
         f.write("-"*40 + "\n")
-        f.write(f"Type:                {type(model).__name__}\n")
-        f.write(f"Sample size:         {model.config.sample_size}\n")
-        f.write(f"In channels:         {model.config.in_channels}\n")
-        f.write(f"Out channels:        {model.config.out_channels}\n")
-        f.write(f"Layers per block:    {model.config.layers_per_block}\n")
-        f.write(f"Block out channels:  {model.config.block_out_channels}\n")
-        f.write(f"Down block types:    {model.config.down_block_types}\n")
-        f.write(f"Up block types:      {model.config.up_block_types}\n")
-        f.write(f"Layers per block:    {model.config.layers_per_block}\n")
-        f.write(f"Dropout:             {model.config.dropout}\n")
-        f.write(f"Attention head dim:  {model.config.attention_head_dim}\n")
+        f.write(model.to_string())
         f.write("\n")
         
         # Model size
@@ -191,7 +189,7 @@ def append_timing_info(run_dir, total_training_seconds, avg_epoch_seconds):
 
 
 def generate_and_log_samples(noise_input, model, noise_scheduler, writer, samples_dir, epoch,
-                             config=None, ema_model=None):
+                             config, ema_model=None):
     """Generate audio samples and log them to TensorBoard.
     
     Args:
@@ -277,27 +275,7 @@ def train(config: TrainingConfig):
     )
 
     # Create a model
-    model = UNet2DModel(
-        sample_size=config.latent_shape,  # the target image resolution
-        in_channels=1,  # the number of input channels, 3 for RGB images
-        out_channels=1,  # the number of output channels
-        layers_per_block=config.layers_per_block,  # how many ResNet layers to use per UNet block
-        block_out_channels=config.block_out_channels,  # More channels -> more parameters
-        attention_head_dim=config.attention_head_dim, 
-        down_block_types=(
-            "DownBlock2D",  # a regular ResNet downsampling block
-            "AttnDownBlock2D",
-            "AttnDownBlock2D",  # a ResNet downsampling block with spatial self-attention
-            "AttnDownBlock2D",
-        ),
-        up_block_types=(
-            "AttnUpBlock2D",
-            "AttnUpBlock2D",  # a ResNet upsampling block with spatial self-attention
-            "AttnUpBlock2D",
-            "UpBlock2D",  # a regular ResNet upsampling block
-        ),
-        dropout=config.dropout,
-    )
+    model = create_model(config)
     model.to(config.device)
 
     # Set the noise scheduler
@@ -311,7 +289,7 @@ def train(config: TrainingConfig):
 
     # Initialize EMA model
     ema_model = None
-    if config.use_ema:
+    if config.use_ema and isinstance(model, DiffusersUNet2DModel):  # EMA currently used for UNet2DModel
         ema_model = EMAModel(
             model.parameters(),
             decay=config.ema_decay,
@@ -320,7 +298,6 @@ def train(config: TrainingConfig):
             model_config=model.config,
         )
         ema_model.to(config.device)
-        print(f"EMA model initialized with decay={config.ema_decay}")
 
     # Save run info
     save_run_info(run_dir, config, model, noise_scheduler, train_size, val_size)
@@ -352,7 +329,14 @@ def train(config: TrainingConfig):
 
     for epoch in range(config.num_epochs):
         epoch_start_time = time.time()
-        for step, batch in enumerate(train_dataloader):
+        progress_bar = tqdm(
+            train_dataloader,
+            desc=f"Epoch {epoch + 1}/{config.num_epochs}",
+            total=len(train_dataloader),
+            leave=False,
+            disable=True
+        )
+        for step, batch in enumerate(progress_bar):
             clean_images = batch.to(config.device)
             # Sample noise to add to the images
             noise = torch.randn(clean_images.shape).to(clean_images.device)
@@ -365,7 +349,7 @@ def train(config: TrainingConfig):
             noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
 
             # Get the model prediction
-            model_pred = model(noisy_images, timesteps, return_dict=False)[0]
+            model_pred = model(noisy_images, timesteps)
 
             if config.prediction_type == "epsilon":
                 target = noise
@@ -382,6 +366,7 @@ def train(config: TrainingConfig):
             # Log step loss to TensorBoard
             writer.add_scalar("loss/step", loss.item(), global_step)
             global_step += 1
+            progress_bar.set_postfix(loss=f"{loss.item():.6f}")
 
             # Update the model parameters with the optimizer
             optimizer.step()
@@ -396,29 +381,32 @@ def train(config: TrainingConfig):
                 ema_model.step(model.parameters())
 
         # Calculate and log epoch loss
+        epoch_time = time.time() - epoch_start_time
         loss_last_epoch = sum(losses[-len(train_dataloader):]) / len(train_dataloader)
         writer.add_scalar("loss/epoch", loss_last_epoch, epoch + 1)
-        
+        print(f"Epoch {epoch + 1} completed in {epoch_time:.2f}s. Loss: {loss_last_epoch:.6f}")
         # Log learning rate
         if lr_scheduler is not None:
             current_lr = lr_scheduler.get_last_lr()[0]
             writer.add_scalar("lr", current_lr, epoch)
 
-        if (epoch) % 5 == 0:
+        if (epoch + 1) % 5 == 0:
             elapsed_time = time.time() - training_start_time
             iterations_per_sec = global_step / elapsed_time
             avg_time_per_epoch = elapsed_time / (epoch + 1)
             remaining_epochs = config.num_epochs - (epoch + 1)
             estimated_remaining = remaining_epochs * avg_time_per_epoch
+            eta = datetime.now() + timedelta(hours=9, seconds=estimated_remaining)
             
             # Format remaining time
             remaining_mins, remaining_secs = divmod(int(estimated_remaining), 60)
             remaining_hours, remaining_mins = divmod(remaining_mins, 60)
             
-            print(f"Epoch:{epoch}, loss: {loss_last_epoch:.6f} | "
+            print(f"Epoch:{epoch + 1}, loss: {loss_last_epoch:.6f} | "
                   f"{iterations_per_sec:.2f} it/s | "
                   f"avg: {avg_time_per_epoch:.2f}s/epoch | "
-                  f"ETA: {remaining_hours}h {remaining_mins}m {remaining_secs}s")
+                f"Remaining: {remaining_hours}h {remaining_mins}m {remaining_secs}s "
+                f"(ETA: {eta.strftime('%Y-%m-%d %H:%M:%S')})")
 
         # Compute and log evaluation loss
         if (epoch + 1) % config.eval_every_epochs == 0:
@@ -433,10 +421,10 @@ def train(config: TrainingConfig):
             print(f"Epoch:{epoch+1}, val_loss: {val_loss}")
 
         # Generate and log audio samples
-        if (epoch) % config.save_audio_epochs == 0:
-            print(f"Generating audio samples at epoch {epoch}...")
+        if (epoch + 1) % config.save_audio_epochs == 0:
+            print(f"Generating audio samples at epoch {epoch + 1}...")
             generate_and_log_samples(
-                sample_noise, model, noise_scheduler, writer, samples_dir, epoch,
+                sample_noise, model, noise_scheduler, writer, samples_dir, epoch + 1,
                 config=config, ema_model=ema_model
             )
 
@@ -445,20 +433,19 @@ def train(config: TrainingConfig):
 
     print("Finished training!")
 
-    generate_and_log_samples(
-        sample_noise, model, noise_scheduler, writer, samples_dir, epoch,
-        config=config, ema_model=ema_model
-    )
+    if not (epoch + 1) % config.save_audio_epochs == 0:
+        print(f"Generating final audio samples...")
+        generate_and_log_samples(
+            sample_noise, model, noise_scheduler, writer, samples_dir, epoch + 1,
+            config=config, ema_model=ema_model
+        )
 
     # Copy EMA weights to model for saving
     if ema_model is not None:
         ema_model.copy_to(model.parameters())
-        print("Copied EMA weights to model for saving")
 
-    trained_pipeline = DDIMPipeline(unet=model, scheduler=noise_scheduler)
-    trained_pipeline.scheduler.config.clip_sample = False
-    print(f"Saving trained pipeline to {pipeline_dir}")
-    trained_pipeline.save_pretrained(str(pipeline_dir))
+    print(f"Saving trained model to {pipeline_dir}")
+    model.save(pipeline_dir, noise_scheduler)
 
     total_training_time = time.time() - run_start_time
     avg_epoch_time = float(np.mean(epoch_times)) if len(epoch_times) > 0 else 0.0
