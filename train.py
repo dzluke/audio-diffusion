@@ -14,12 +14,16 @@ from torch.utils.tensorboard import SummaryWriter
 from diffusers import DDPMScheduler, UNet2DModel
 from diffusers.training_utils import EMAModel
 from diffusers.optimization import get_cosine_schedule_with_warmup
-from dataset import LatentAudioDataset, decode_audio, load_model as load_audio_codec
-from evaluate import compute_validation_loss
+from dataset import LatentAudioDataset, SAO_EMBEDDINGS_PATH, decode_audio, load_model as load_audio_codec
+from evaluate import (
+    compute_birdnet_classification_metrics,
+    compute_birdnet_fad,
+    compute_or_load_reference_birdnet_stats,
+    compute_validation_loss,
+    get_birdnet_model,
+)
 from models import create_model, DiffusersUNet2DModel
 
-
-EMBEDDINGS_PATH = Path("C:/Users/dzluk/stable-audio-tools/data/blackbird/embeddings")
 SAMPLING_RATE = 44100
 
 class TrainingConfig:
@@ -28,17 +32,20 @@ class TrainingConfig:
     # model_name = "SAO-DiT"
 
     latent_shape = (64, 256)
+    random_crop = True  # whether to use random cropping of latent audio during training
     train_batch_size = 16
     eval_batch_size = 3 # how many audios to sample during evaluation
-    num_epochs = 300
+    num_epochs = 1000
     learning_rate = 4e-4
-    save_audio_epochs = 50  # how often to sample during training (in epochs)
-    # save_model_epochs = 50  # how often to save the model during training (in epochs)
-    eval_every_epochs = 10  # how often to compute evaluation loss
-    
-    val_split = 0.1  # fraction of data to use for validation
-    output_dir = Path("logs")
 
+    # evaluation settings
+    save_audio_epochs = 250  # how often to sample during training (in epochs)
+    # eval_every_epochs = 10
+    eval_every_epochs = 100  # how often to compute evaluation loss
+    val_split = 0.1  # fraction of data to use for validation
+    fad_every_epochs = 250  # how often to compute BirdNET FAD
+    birdnet_fad_num_samples = 50
+    
     # model architecture settings
     prediction_type = "v_prediction"  # "epsilon" or "v_prediction"
     # block_out_channels = (64, 128, 128, 256)  # used up until 3/5/26
@@ -55,10 +62,21 @@ class TrainingConfig:
             "UpBlock2D",
             "UpBlock2D", 
     )
+    # block_out_channels = (128, 256, 512)
+    # down_block_types = (
+    #         "DownBlock2D",
+    #         "DownBlock2D",
+    #         "AttnDownBlock2D",
+    # )
+    # up_block_types = (
+    #         "AttnUpBlock2D",
+    #         "UpBlock2D", 
+    #         "UpBlock2D", 
+    # )
     layers_per_block = 2 # default is 2, can try 3 but will almost double training time
     dropout = 0.1 # default is 0
     attention_head_dim = 8 # default is 8, try 32 (the number of attention heads = num channels / attention_head_dim)
-    sample_type = "conv" # can be "conv" or "resnet"
+    sample_type = "resnet" # can be "conv" or "resnet"
     
     # EMA settings
     use_ema = True  # whether to use exponential moving average
@@ -70,6 +88,7 @@ class TrainingConfig:
     use_lr_scheduler = False  # whether to use learning rate scheduling
     lr_warmup_steps = 500  # number of warmup steps for learning rate scheduler
 
+    output_dir = Path("logs")
     seed = 42
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -130,9 +149,10 @@ def save_run_info(run_dir, config, model, noise_scheduler, train_size, val_size)
         # Dataset info
         f.write("DATASET\n")
         f.write("-"*40 + "\n")
-        f.write(f"Embeddings path:     {EMBEDDINGS_PATH}\n")
+        f.write(f"Embeddings path:     {SAO_EMBEDDINGS_PATH}\n")
         f.write(f"Train size:          {train_size}\n")
         f.write(f"Validation size:     {val_size}\n")
+        f.write(f"Random crop:         {config.random_crop}\n")
         f.write("\n")
         
         # Noise scheduler
@@ -161,7 +181,10 @@ def save_run_info(run_dir, config, model, noise_scheduler, train_size, val_size)
         # FAD evaluation settings
         f.write("EVALUATION METRICS\n")
         f.write("-"*40 + "\n")
-        f.write("None!")
+        f.write(f"Validation loss every:             {config.eval_every_epochs} epochs\n")
+        f.write(f"BirdNET cls metrics every:         {config.eval_every_epochs} epochs\n")
+        f.write(f"BirdNET FAD every:                 {config.fad_every_epochs} epochs\n")
+        f.write(f"BirdNET FAD sample count:          {config.birdnet_fad_num_samples}\n")
         f.write("\n")
         
         f.write("="*60 + "\n")
@@ -243,6 +266,51 @@ def generate_and_log_samples(noise_input, model, noise_scheduler, writer, sample
     model.train()
 
 
+def generate_audio_batch_for_birdnet_metrics(
+    model,
+    noise_scheduler,
+    config,
+    epoch,
+    num_samples,
+    ema_model=None,
+):
+    """Generate decoded mono audio for BirdNET metric computation."""
+    if num_samples <= 0:
+        return []
+
+    model.eval()
+
+    if ema_model is not None:
+        ema_model.store(model.parameters())
+        ema_model.copy_to(model.parameters())
+
+    metric_noise = torch.randn(
+        (num_samples, 1, *config.latent_shape),
+        generator=torch.Generator(device=config.device).manual_seed(config.seed + 100000 + epoch),
+        device=config.device,
+    )
+    num_sampling_steps = 50
+    samples = sample(metric_noise, model, noise_scheduler, num_sampling_steps)
+
+    audio_codec, _ = load_audio_codec()
+
+    generated_audio_mono = []
+    for s in samples:
+        audio = decode_audio(s, audio_codec)
+        audio_mono = (audio[0] + audio[1]) / 2
+        generated_audio_mono.append(audio_mono.detach().cpu().numpy().astype(np.float32, copy=False))
+
+    del audio_codec
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    if ema_model is not None:
+        ema_model.restore(model.parameters())
+
+    model.train()
+    return generated_audio_mono
+
+
 def train(config: TrainingConfig):
     run_start_time = time.time()
 
@@ -256,7 +324,7 @@ def train(config: TrainingConfig):
     # Initialize TensorBoard writer
     writer = SummaryWriter(log_dir=str(logs_dir))
 
-    dataset = LatentAudioDataset(EMBEDDINGS_PATH, normalize=False, dim=config.latent_shape[1])
+    dataset = LatentAudioDataset(SAO_EMBEDDINGS_PATH, normalize=False, crop_dim=config.latent_shape[1], random_crop_per_epoch=config.random_crop)
 
     # Split dataset into train and validation sets
     val_size = int(len(dataset) * config.val_split)
@@ -323,6 +391,10 @@ def train(config: TrainingConfig):
     losses = []
     global_step = 0
     epoch_times = []
+
+    # BirdNET metrics runtime/cache (lazy initialization).
+    birdnet_model = None
+    birdnet_reference_stats = None
     
     # Timing tracking
     training_start_time = time.time()
@@ -419,6 +491,66 @@ def train(config: TrainingConfig):
             )
             writer.add_scalar("loss/validation", val_loss, epoch + 1)
             print(f"Epoch:{epoch+1}, val_loss: {val_loss}")
+
+        run_birdnet_cls = (epoch + 1) % config.eval_every_epochs == 0
+        run_birdnet_fad = (epoch + 1) % config.fad_every_epochs == 0
+        if run_birdnet_cls or run_birdnet_fad:
+            n_metric_samples = config.eval_batch_size if run_birdnet_cls else 0
+            if run_birdnet_fad:
+                n_metric_samples = max(n_metric_samples, config.birdnet_fad_num_samples)
+
+            metric_audio_batch = generate_audio_batch_for_birdnet_metrics(
+                model=model,
+                noise_scheduler=noise_scheduler,
+                config=config,
+                epoch=epoch + 1,
+                num_samples=n_metric_samples,
+                ema_model=ema_model,
+            )
+
+            if birdnet_model is None:
+                birdnet_model = get_birdnet_model()
+
+            if run_birdnet_cls:
+                birdnet_cls_time = time.time()
+                cls_audio = metric_audio_batch[: config.eval_batch_size]
+                try:
+                    cls_metrics = compute_birdnet_classification_metrics(
+                        generated_sounds=cls_audio,
+                        sample_rate=SAMPLING_RATE,
+                        birdnet_model=birdnet_model,
+                    )
+                    writer.add_scalar("birdnet/cls_conf", cls_metrics["cls_conf"], epoch + 1)
+                    writer.add_scalar("birdnet/cls_error", cls_metrics["cls_error"], epoch + 1)
+                    print(
+                        f"Epoch:{epoch+1}, birdnet cls_conf: {cls_metrics['cls_conf']:.6f}, "
+                        f"cls_error: {cls_metrics['cls_error']:.6f} (Took {_format_duration(time.time() - birdnet_cls_time)})"
+                    )
+                except Exception as exc:
+                    writer.add_scalar("birdnet/cls_conf", float("nan"), epoch + 1)
+                    writer.add_scalar("birdnet/cls_error", float("nan"), epoch + 1)
+                    print(f"Warning: BirdNET classification metrics failed at epoch {epoch+1}: {exc}")
+
+            if run_birdnet_fad:
+                birdnet_fad_time = time.time()
+                fad_audio = metric_audio_batch[: config.birdnet_fad_num_samples]
+                try:
+                    if birdnet_reference_stats is None:
+                        birdnet_reference_stats = compute_or_load_reference_birdnet_stats(
+                            birdnet_model=birdnet_model,
+                        )
+
+                    fad_score = compute_birdnet_fad(
+                        generated_sounds=fad_audio,
+                        sample_rate=SAMPLING_RATE,
+                        birdnet_model=birdnet_model,
+                        reference_stats=birdnet_reference_stats,
+                    )
+                    writer.add_scalar("birdnet/FAD", fad_score, epoch + 1)
+                    print(f"Epoch:{epoch+1}, birdnet FAD: {fad_score:.6f} (Took {_format_duration(time.time() - birdnet_fad_time)})")
+                except Exception as exc:
+                    writer.add_scalar("birdnet/FAD", float("nan"), epoch + 1)
+                    print(f"Warning: BirdNET FAD failed at epoch {epoch+1}: {exc}")
 
         # Generate and log audio samples
         if (epoch + 1) % config.save_audio_epochs == 0:

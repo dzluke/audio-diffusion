@@ -8,16 +8,23 @@ This module provides:
 
 import os
 from pathlib import Path
-from typing import Tuple, Optional, Any, Dict
+from typing import Tuple, Optional, Any, Dict, List
 
 import numpy as np
 import scipy.io.wavfile
 import torch
 import soundfile as sf
+import librosa
 from einops import rearrange
 from torch.utils.data import Dataset
 from stable_audio_tools.inference.utils import prepare_audio
 from stable_audio_tools.interface.gradio import load_model as _load_model
+from random import randrange
+
+DATA_PATH = Path("C:/Users/dzluk/stable-audio-tools/data/blackbird")
+AUDIO_PATH = DATA_PATH / "audio"
+SAO_EMBEDDINGS_PATH = DATA_PATH / "embeddings"
+BIRDNET_EMBEDDINGS_PATH = DATA_PATH / "birdnet_embeddings"
 
 
 def load_model(
@@ -127,9 +134,9 @@ def decode_audio(encoding: torch.Tensor, model) -> Tuple[torch.Tensor, torch.Ten
     """
     audio = model.pretransform.decode(encoding).squeeze(0)
     
-    maxval = torch.max(torch.abs(audio))
-    if maxval > 0:
-        audio = audio / maxval
+    # maxval = torch.max(torch.abs(audio))
+    # if maxval > 0:
+    #     audio = audio / maxval
 
     # I think jupyter can work with audio in range [-1, 1], so we dont need this
     # if jupyter: # convert to the format expected by IPython.display.Audio
@@ -170,8 +177,6 @@ def normalize_latents(latents: torch.Tensor, mean: float, std: float) -> torch.T
 def denormalize_latents(latents: torch.Tensor, mean: float, std: float) -> torch.Tensor:
     """Inverse of normalize_latents."""
     return latents * std + mean
-
-
 def generate_embeddings(
     audio_dir: str | Path,
     save_dir: str | Path,
@@ -245,21 +250,21 @@ class LatentAudioDataset(Dataset):
              E.g., dim=64 on (1, 64, 1024) yields 16 samples of (1, 64, 64) per file.
     """
     
-    def __init__(self, root: str | Path, normalize: bool = False, transform: Optional[Any] = None, dim: Optional[int] = None):
+    def __init__(self, root: str | Path, normalize: bool = False, transform: Optional[Any] = None, crop_dim: Optional[int] = None, random_crop_per_epoch: bool = False):
         self.root = Path(root)
         self.files = [f for f in os.listdir(root) if f.endswith(".pt") and f != "latent_stats.pt"]
         self.normalize = normalize
         self.mean: Optional[float] = None
         self.std: Optional[float] = None
         self.transform = transform
-        self.dim = dim
+        self.crop_dim = crop_dim
         self.slices_per_file = 1
-        
+        self.random_crop_per_epoch = random_crop_per_epoch
         # Compute number of slices per file based on first file's shape
-        if self.dim is not None and len(self.files) > 0:
+        if self.crop_dim is not None and len(self.files) > 0:
             sample = torch.load(self.root / self.files[0])
             last_dim = sample.shape[-1]
-            self.slices_per_file = last_dim // self.dim
+            self.slices_per_file = last_dim // self.crop_dim
         
         if normalize:
             self._load_or_compute_stats()
@@ -287,9 +292,12 @@ class LatentAudioDataset(Dataset):
         sample = torch.load(self.root / self.files[file_idx])
         
         # Slice to specified dimension if provided
-        if self.dim is not None:
-            start = slice_idx * self.dim
-            end = start + self.dim
+        if self.crop_dim is not None:
+            if self.random_crop_per_epoch:
+                start = randrange(0, sample.shape[-1] - self.crop_dim)
+            else:
+                start = slice_idx * self.crop_dim
+            end = start + self.crop_dim
             sample = sample[..., start:end]
         
         if self.normalize and self.mean is not None and self.std is not None:
@@ -299,13 +307,40 @@ class LatentAudioDataset(Dataset):
         return sample
 
 
+def generate_birdnet_embeddings(
+    audio_dir: Path,
+    save_dir: Path,
+    expected_sr: int = 44100,
+    extensions: Tuple[str, ...] = (".wav", ".flac", ".mp3"),
+) -> Tuple[int, int]:
+    """Generate and save BirdNET embeddings for all audio files in a directory.
+    
+    Args:
+        audio_dir: Directory containing audio files.
+        save_dir: Directory to save embedding .pt files.
+        model: The BirdNET model for generating embeddings.
+        params: Dictionary containing model parameters.
+        device: Device to run encoding on.
+        expected_sr: Expected sample rate of audio files.
+        chunk_size: Number of samples per chunk.
+        extensions: Tuple of valid audio file extensions.
+        
+    Returns:
+        Tuple of (num_files, num_chunks) processed.
+    """
+    import birdnet
+    birdnet_model = birdnet.load("acoustic", "2.4", "pb", precision="fp32")
+    for path in audio_dir.iterdir():
+        if path.suffix.lower() in extensions:
+            embedding = birdnet_model.encode(str(path))
+            torch.save(embedding, save_dir / f"{path.stem}.pt")
+
+
+
 if __name__ == "__main__":
     # Configuration
     SAMPLING_RATE = 44100
     CHUNK_SIZE = 2097152
-    DATA_PATH = Path("C:/Users/dzluk/stable-audio-tools/data/blackbird")
-    AUDIO_PATH = DATA_PATH / "audio"
-    SAVE_PATH = DATA_PATH / "embeddings"
     
     # Load the model
     model, params = load_model()
@@ -313,7 +348,7 @@ if __name__ == "__main__":
     # Generate embeddings
     num_files, num_chunks = generate_embeddings(
         audio_dir=AUDIO_PATH,
-        save_dir=SAVE_PATH,
+        save_dir=SAO_EMBEDDINGS_PATH,
         model=model,
         sample_size=params["sample_size"],
         device=params["device"],
@@ -322,4 +357,3 @@ if __name__ == "__main__":
     )
     
     print("Done!")
-

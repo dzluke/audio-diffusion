@@ -74,6 +74,8 @@ class DiffusionModel(nn.Module, ABC):
 class DiffusersUNet2DModel(DiffusionModel):
 	"""Wrapper around diffusers ``UNet2DModel`` for latent audio diffusion."""
 
+	name = "Diffusers-UNet2DModel"
+
 	def __init__(self, config: Any) -> None:
 		super().__init__()
 		self.latent_shape = config.latent_shape
@@ -104,7 +106,7 @@ class DiffusersUNet2DModel(DiffusionModel):
 
 	def to_string(self) -> str:
 		return (
-			f"Type:                {type(self.backbone).__name__}\n"
+			f"Name:                {self.name}\n"
 			f"Latent shape:        {self.latent_shape}\n"
 			f"In channels:         {self.config.in_channels}\n"
 			f"Out channels:        {self.config.out_channels}\n"
@@ -133,6 +135,8 @@ class DiffusersUNet2DModel(DiffusionModel):
 class SAODiTModel(DiffusionModel):
 	"""Wrapper around stable-audio-tools ``DiffusionTransformer``."""
 
+	name = "SAO-DiT"
+
 	def __init__(self, config: Any) -> None:
 		super().__init__()
 		self.latent_shape = config.latent_shape
@@ -158,9 +162,8 @@ class SAODiTModel(DiffusionModel):
 
 	def to_string(self) -> str:
 		return (
-			f"Type:                {type(self.backbone).__name__}\n"
+			f"Type:                {self.name}\n"
 			f"Latent shape:        {self.latent_shape}\n"
-			f"IO channels:         {self.latent_shape[0]}\n"
 		)
 
 	def save(self, folder_path: Path | str, noise_scheduler: Any) -> None:

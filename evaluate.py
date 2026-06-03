@@ -4,10 +4,50 @@ This module provides:
 - Validation loss computation
 """
 
+import hashlib
+import contextlib
+import io
+import logging
+import os
+from pathlib import Path
+import warnings
+
 import numpy as np
 from scipy import linalg
 import torch
 import torch.nn.functional as F
+
+# Quiet TensorFlow/absl/BirdNET startup chatter before importing BirdNET.
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
+os.environ.setdefault("ABSL_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("GLOG_minloglevel", "3")
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+import birdnet
+
+from dataset import AUDIO_PATH, BIRDNET_EMBEDDINGS_PATH
+
+
+for _logger_name in ("absl", "tensorflow", "birdnet", "transformers"):
+    logging.getLogger(_logger_name).setLevel(logging.ERROR)
+
+
+@contextlib.contextmanager
+def _suppress_birdnet_noise():
+    """Suppress warnings and stdout/stderr noise from BirdNET backends."""
+    previous_disable_level = logging.root.manager.disable
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        logging.disable(logging.CRITICAL)
+        with contextlib.redirect_stdout(io.StringIO()):
+            with contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    yield
+                finally:
+                    logging.disable(previous_disable_level)
 
 
 def compute_validation_loss(model, val_dataloader, noise_scheduler, device, prediction_type):
@@ -179,3 +219,216 @@ def get_reference_embeddings(dataset, num_samples=None):
         embeddings.append(emb)
     
     return torch.stack(embeddings)
+
+
+DEFAULT_BIRDNET_TARGET_SPECIES = "Turdus merula_Eurasian Blackbird"
+
+def get_birdnet_model():
+    """Load BirdNET acoustic model (PB backend, FP32)."""
+    with _suppress_birdnet_noise():
+        return birdnet.load("acoustic", "2.4", "pb", precision="fp32")
+
+
+def _to_mono_float32(audio: np.ndarray | torch.Tensor) -> np.ndarray:
+    if isinstance(audio, torch.Tensor):
+        audio = audio.detach().cpu().numpy()
+
+    audio = np.asarray(audio)
+    if audio.ndim == 1:
+        mono = audio
+    elif audio.ndim == 2:
+        # Accept both [C, N] and [N, C], convert to mono by channel average.
+        if audio.shape[0] <= 8:
+            mono = audio.mean(axis=0)
+        elif audio.shape[1] <= 8:
+            mono = audio.mean(axis=1)
+        else:
+            raise ValueError(f"Unexpected 2D audio shape {audio.shape}.")
+    else:
+        raise ValueError(f"Expected 1D/2D audio, got shape {audio.shape}.")
+
+    return np.ascontiguousarray(mono.astype(np.float32, copy=False))
+
+
+def _build_audio_tuples(generated_sounds, sample_rate):
+    sr = int(sample_rate)
+    if sr <= 0:
+        raise ValueError("sample_rate must be > 0")
+    return [(_to_mono_float32(audio), sr) for audio in generated_sounds]
+
+
+def compute_birdnet_classification_metrics(
+    generated_sounds,
+    sample_rate,
+    birdnet_model,
+    target_species=DEFAULT_BIRDNET_TARGET_SPECIES,
+    device="CPU",
+):
+    """Compute BirdNET cls_conf and cls_error from generated audio.
+
+    cls_conf: median over samples of max target confidence across windows.
+    cls_error: median over samples of fraction of windows where top-1 species is not target.
+    """
+    if len(generated_sounds) == 0:
+        return {"cls_conf": float("nan"), "cls_error": float("nan")}
+
+    audio_tuples = _build_audio_tuples(generated_sounds, sample_rate)
+    n_inputs = len(audio_tuples)
+
+    # 1) Target confidence trajectory (single species only)
+    with _suppress_birdnet_noise():
+        target_pred = birdnet_model.predict_arrays(
+            audio_tuples,
+            device=device,
+            top_k=1,
+            default_confidence_threshold=-np.inf,
+            custom_species_list=[target_species],
+        )
+        target_df = target_pred.to_dataframe()
+
+    per_input_conf = np.zeros(n_inputs, dtype=np.float64)
+    if not target_df.empty:
+        grouped = target_df.groupby("input")["confidence"].max()
+        for i in range(n_inputs):
+            if i in grouped.index:
+                per_input_conf[i] = float(grouped.loc[i])
+
+    # 2) Frame-level top1 misclassification ratio
+    with _suppress_birdnet_noise():
+        top1_pred = birdnet_model.predict_arrays(
+            audio_tuples,
+            device=device,
+            top_k=1,
+            default_confidence_threshold=-np.inf,
+        )
+        top1_df = top1_pred.to_dataframe()
+
+    per_input_err = np.ones(n_inputs, dtype=np.float64)
+    if not top1_df.empty:
+        top1_df = top1_df.copy()
+        top1_df["mis"] = top1_df["species_name"] != target_species
+        grouped_err = top1_df.groupby("input")["mis"].mean()
+        for i in range(n_inputs):
+            if i in grouped_err.index:
+                per_input_err[i] = float(grouped_err.loc[i])
+
+    return {
+        "cls_conf": float(np.median(per_input_conf)),
+        "cls_error": float(np.median(per_input_err)),
+    }
+
+
+def _list_reference_audio_files(reference_audio_dir: Path, max_files: int | None = None):
+    exts = {".wav", ".flac", ".ogg", ".opus", ".mp3", ".aiff", ".aifc", ".w64"}
+    files = [p for p in reference_audio_dir.rglob("*") if p.is_file() and p.suffix.lower() in exts]
+    files = sorted(files)
+    if max_files is not None:
+        files = files[:max_files]
+    return files
+
+
+def _reference_signature(files):
+    h = hashlib.sha256()
+    for p in files:
+        st = p.stat()
+        h.update(str(p).encode("utf-8"))
+        h.update(str(st.st_size).encode("utf-8"))
+        h.update(str(st.st_mtime_ns).encode("utf-8"))
+    return h.hexdigest()
+
+
+def _extract_window_embeddings(result):
+    embeddings = result.embeddings
+    mask = result.embeddings_masked
+    valid_window_mask = ~(mask.all(axis=2))
+    windows = embeddings[valid_window_mask]
+    return np.asarray(windows, dtype=np.float64)
+
+
+def compute_or_load_reference_birdnet_stats(
+    birdnet_model,
+    reference_audio_dir=AUDIO_PATH,
+    reference_cache_dir=BIRDNET_EMBEDDINGS_PATH,
+    max_files=None,
+    device="CPU",
+):
+    """Build or load cached BirdNET reference window-embedding statistics."""
+    reference_audio_dir = Path(reference_audio_dir)
+    reference_cache_dir = Path(reference_cache_dir)
+    reference_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    files = _list_reference_audio_files(reference_audio_dir, max_files=max_files)
+    if len(files) == 0:
+        raise RuntimeError(f"No reference audio files found in {reference_audio_dir}")
+
+    signature = _reference_signature(files)
+    stats_path = reference_cache_dir / "reference_stats.npz"
+    embeddings_path = reference_cache_dir / "reference_window_embeddings.npy"
+    backend_key = f"{type(birdnet_model).__name__}:{device}"
+
+    if stats_path.exists() and embeddings_path.exists():
+        cached = np.load(stats_path, allow_pickle=True)
+        if (
+            str(cached["signature"]) == signature
+            and str(cached["model_backend"]) == backend_key
+        ):
+            return {
+                "mu": cached["mu"],
+                "sigma": cached["sigma"],
+                "n_windows": int(cached["n_windows"]),
+                "signature": signature,
+            }
+
+    with _suppress_birdnet_noise():
+        encoded = birdnet_model.encode(files)
+
+    windows = _extract_window_embeddings(encoded)
+    if windows.shape[0] < 2:
+        raise RuntimeError("Need at least 2 BirdNET windows for reference statistics.")
+
+    mu = np.mean(windows, axis=0)
+    sigma = np.cov(windows, rowvar=False)
+
+    np.save(embeddings_path, windows.astype(np.float32, copy=False))
+    np.savez(
+        stats_path,
+        mu=mu,
+        sigma=sigma,
+        n_windows=np.array([windows.shape[0]], dtype=np.int64),
+        signature=np.array(signature),
+        model_backend=np.array(backend_key),
+    )
+
+    return {
+        "mu": mu,
+        "sigma": sigma,
+        "n_windows": int(windows.shape[0]),
+        "signature": signature,
+    }
+
+
+def compute_birdnet_fad(
+    generated_sounds,
+    sample_rate,
+    birdnet_model,
+    reference_stats,
+    device="CPU",
+):
+    """Compute BirdNET-window FAD without per-file pooling."""
+    if len(generated_sounds) == 0:
+        return float("nan")
+
+    audio_tuples = _build_audio_tuples(generated_sounds, sample_rate)
+    with _suppress_birdnet_noise():
+        encoded = birdnet_model.encode_arrays(audio_tuples, device=device)
+    gen_windows = _extract_window_embeddings(encoded)
+
+    if gen_windows.shape[0] < 2:
+        return float("nan")
+
+    mu_gen = np.mean(gen_windows, axis=0)
+    sigma_gen = np.cov(gen_windows, rowvar=False)
+    mu_ref = reference_stats["mu"]
+    sigma_ref = reference_stats["sigma"]
+
+    return float(calculate_frechet_distance(mu_gen, sigma_gen, mu_ref, sigma_ref))
